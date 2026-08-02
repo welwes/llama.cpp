@@ -543,6 +543,14 @@ extern "C" {
     LLAMA_API size_t llama_max_parallel_sequences(void);
     LLAMA_API size_t llama_max_tensor_buft_overrides(void);
 
+    // H1 expert cache: VRAM-кэш экспертов MoE (форк, см. src/llama-h1ec.h).
+    // llama_h1ec_init звать ПОСЛЕ загрузки модели и ДО создания контекста;
+    // llama_h1ec_assign — между вызовами llama_decode (кладёт эксперта в слот,
+    // expert_id < 0 освобождает слот). Возврат false = не применилось.
+    LLAMA_API bool    llama_h1ec_init    (struct llama_model * model, int32_t n_slots);
+    LLAMA_API int32_t llama_h1ec_n_slots (const struct llama_model * model);
+    LLAMA_API bool    llama_h1ec_assign  (struct llama_model * model, int32_t il, int32_t slot, int32_t expert_id);
+
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
     LLAMA_API bool llama_supports_gpu_offload(void);
