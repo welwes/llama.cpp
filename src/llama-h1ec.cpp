@@ -62,16 +62,18 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
     };
     ctx.reset(ggml_init(ip));
 
-    // раскладка пула: кэш-тензоры внахлёст (шаг = n_slots столбцов, вид на
-    // n_slots+n_expert), затем общий хвост n_expert * max(размер эксперта)
+    // Раскладка: ПУЛЫ ПО ТИПУ КВАНТА. Хвост «мусорных» столбцов тензора
+    // перекрывается со слотами следующих тензоров ТОГО ЖЕ типа: любые валидные
+    // блоки этого типа декодируются в конечные числа. Кросс-типовой оверлап
+    // ЗАПРЕЩЁН: байты чужого кванта, прочитанные как fp16-скейлы, могут дать
+    // INF → по цепочке → INF·0 = NaN → NaN травит всю сеть (найдено 08-03).
+    // Хвост каждой типовой зоны — n_expert столбцов, занулён buffer_clear'ом.
     struct pending_t {
         ggml_tensor * t;
         size_t        off;
     };
     std::vector<pending_t> pend;
 
-    size_t off = 0;
-    size_t max_nb2 = 0;
     int n_enabled = 0;
 
     for (int il = 0; il < n_layer; il++) {
@@ -94,12 +96,6 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
             ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), src->type, src->ne[0], src->ne[1], l.n_slots + n_expert);
             ggml_format_name(t, "h1ec.%d.%s", il, names[k]);
             GGML_ASSERT(t->nb[2] == src->nb[2]); // одинаковый тип/размер среза эксперта
-            off = h1ec_align(off);
-            pend.push_back({ t, off });
-            // обычный шаг БЕЗ хвоста (хвост внахлёст со следующими тензорами);
-            // fat-режим — полный шаг, перекрытий нет (диагностика)
-            off += (size_t) (fat_pool ? l.n_slots + n_expert : l.n_slots) * t->nb[2];
-            max_nb2 = std::max(max_nb2, (size_t) t->nb[2]);
             *dsts[k] = t;
         }
 
@@ -119,7 +115,38 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
         return false;
     }
 
-    off = h1ec_align(off) + (size_t) n_expert * max_nb2; // общий мусорный хвост
+    // размещение: группируем кэш-тензоры по типу, внутри группы — внахлёст
+    size_t off = 0;
+    std::vector<ggml_type> group_types;
+    for (auto & l : layers) {
+        if (!l.enabled) {
+            continue;
+        }
+        for (ggml_tensor * t : { l.cache_up, l.cache_gate, l.cache_down }) {
+            if (std::find(group_types.begin(), group_types.end(), t->type) == group_types.end()) {
+                group_types.push_back(t->type);
+            }
+        }
+    }
+    for (ggml_type gt : group_types) {
+        size_t group_max_nb2 = 0;
+        for (auto & l : layers) {
+            if (!l.enabled) {
+                continue;
+            }
+            for (ggml_tensor * t : { l.cache_up, l.cache_gate, l.cache_down }) {
+                if (t->type != gt) {
+                    continue;
+                }
+                off = h1ec_align(off);
+                pend.push_back({ t, off });
+                off += (size_t) (fat_pool ? l.n_slots + n_expert : l.n_slots) * t->nb[2];
+                group_max_nb2 = std::max(group_max_nb2, (size_t) t->nb[2]);
+            }
+        }
+        // хвост зоны: мусорные столбцы последних тензоров группы читают отсюда (нули)
+        off = h1ec_align(off) + (size_t) n_expert * group_max_nb2;
+    }
 
     // slot_map/mask — в тот же VRAM-буфер; cpu_map — в CPU-память (это делает
     // get_rows по нему CPU-узлом и режет GPU-сплит для перекрытия, см. llama-graph.cpp)
