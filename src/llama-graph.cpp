@@ -2142,10 +2142,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }; // конец expert_chain
 
     // H1EC: сплит на VRAM-кэш + CPU-остаток (схема v3, см. llama-h1ec.h).
+    // Только декод (n_tokens<=8): префилл compute-bound и дружит с offload_op,
+    // плюс отрицательные id CPU-ветки не должны попасть на CUDA.
     // Ограничения: биасы/скейлы индексируются оригинальными id — с кэшем нельзя;
     // GROVEMOE переизображает id; weight_before_ffn меняет порядок взвешивания.
     const llama_h1ec_layer * h1l = h1ec ? h1ec->get_layer(il) : nullptr;
-    const bool use_h1 = h1l != nullptr && n_tokens > 0 && !weight_before_ffn &&
+    const bool use_h1 = h1l != nullptr && n_tokens > 0 && n_tokens <= 8 && !weight_before_ffn &&
         gate_up_exps == nullptr && arch != LLM_ARCH_GROVEMOE &&
         up_exps_b   == nullptr && gate_exps_b   == nullptr && down_exps_b == nullptr &&
         gate_up_exps_b == nullptr &&
@@ -2156,7 +2158,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * experts = nullptr;
 
     if (use_h1) {
-        // карты лежат на GPU; topk может быть невыгружаемым видом — уплотняем
+        // topk может быть невыгружаемым видом — уплотняем
         ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used * n_tokens);
 
         ggml_tensor * ids_gpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, h1l->slot_map, sel_flat), n_expert_used, n_tokens);
@@ -2167,6 +2169,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         ggml_tensor * w_gpu = ggml_mul(ctx0, weights, m_hit); // веса промахов занулены
         ggml_tensor * w_cpu = ggml_sub(ctx0, weights, w_gpu); // веса попаданий занулены
+
+        // Порядок узлов = порядок сплитов планировщика. cpu_map лежит в CPU-памяти,
+        // поэтому ids_cpu — CPU-узел; закрепив его МЕЖДУ гейтингом и кэш-цепочкой,
+        // получаем сплиты [GPU гейтинг+веса][CPU ids][GPU кэш][CPU эксперты][GPU add]:
+        // CPU-эксперты стартуют, дождавшись лишь короткого сплита ids, и считаются
+        // ПАРАЛЛЕЛЬНО с кэш-цепочкой на GPU (одна очередь CUDA, событие после ids).
+        ggml_build_forward_expand(gf, w_gpu);
+        ggml_build_forward_expand(gf, w_cpu);
+        ggml_build_forward_expand(gf, ids_cpu);
 
         ggml_tensor * e_gpu = expert_chain(cur, ids_gpu, w_gpu, nullptr, h1l->cache_up, h1l->cache_gate, h1l->cache_down);
         ggml_tensor * e_cpu = expert_chain(cur, ids_cpu, w_cpu, nullptr, up_exps, gate_exps, down_exps);

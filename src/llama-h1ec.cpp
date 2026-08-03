@@ -98,32 +98,48 @@ bool llama_h1ec::init(const llama_model & model, int32_t n_slots_arg) {
 
     off = h1ec_align(off) + (size_t) n_expert * max_nb2; // общий мусорный хвост
 
-    // карты — в тот же буфер, после хвоста
+    // slot_map/mask — в тот же VRAM-буфер; cpu_map — в CPU-память (это делает
+    // get_rows по нему CPU-узлом и режет GPU-сплит для перекрытия, см. llama-graph.cpp)
+    std::vector<pending_t> pend_cpu;
+    size_t off_cpu = 0;
     for (auto & l : layers) {
         if (!l.enabled) {
             continue;
         }
-        for (ggml_tensor * t : { l.slot_map, l.cpu_map, l.mask }) {
+        for (ggml_tensor * t : { l.slot_map, l.mask }) {
             off = h1ec_align(off);
             pend.push_back({ t, off });
             off += ggml_nbytes(t);
         }
+        off_cpu = h1ec_align(off_cpu);
+        pend_cpu.push_back({ l.cpu_map, off_cpu });
+        off_cpu += ggml_nbytes(l.cpu_map);
     }
 
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(cpu_dev != nullptr);
+
     buf.reset(ggml_backend_buft_alloc_buffer(buft, off));
-    if (!buf) {
+    buf_cpu.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(cpu_dev), off_cpu));
+    if (!buf || !buf_cpu) {
         LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB on %s\n", __func__, off / 1024.0 / 1024.0, ggml_backend_dev_name(dev));
         layers.clear();
         return false;
     }
 
-    char * base = (char *) ggml_backend_buffer_get_base(buf.get());
-    for (const auto & p : pend) {
-        if (ggml_backend_tensor_alloc(buf.get(), p.t, base + p.off) != GGML_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("%s: tensor alloc failed for %s\n", __func__, p.t->name);
-            layers.clear();
-            buf.reset();
-            return false;
+    char * base     = (char *) ggml_backend_buffer_get_base(buf.get());
+    char * base_cpu = (char *) ggml_backend_buffer_get_base(buf_cpu.get());
+    for (auto * pv : { &pend, &pend_cpu }) {
+        for (const auto & p : *pv) {
+            char * b = pv == &pend ? base : base_cpu;
+            ggml_backend_buffer_t bb = pv == &pend ? buf.get() : buf_cpu.get();
+            if (ggml_backend_tensor_alloc(bb, p.t, b + p.off) != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: tensor alloc failed for %s\n", __func__, p.t->name);
+                layers.clear();
+                buf.reset();
+                buf_cpu.reset();
+                return false;
+            }
         }
     }
 
@@ -197,7 +213,7 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
         }
 
         l.h_slot[eid] = slot;
-        l.h_cpu [eid] = 0;    // попадание: CPU-ветка считает эксперта 0 с весом 0
+        l.h_cpu [eid] = -1;   // попадание: CPU mul_mat_id пропускает строку без чтения весов
         l.h_mask[eid] = 1.0f;
         l.slot_eid[slot] = eid;
     }

@@ -33,9 +33,12 @@ struct llama_h1ec_layer {
     ggml_tensor * cache_gate = nullptr;
     ggml_tensor * cache_down = nullptr;
 
-    ggml_tensor * slot_map = nullptr; // I32 [1, n_expert]: eid -> слот | n_slots+eid (промах)
-    ggml_tensor * cpu_map  = nullptr; // I32 [1, n_expert]: eid -> 0 (попадание) | eid
-    ggml_tensor * mask     = nullptr; // F32 [1, n_expert]: 1.0 если eid в кэше
+    ggml_tensor * slot_map = nullptr; // I32 [1, n_expert] VRAM: eid -> слот | n_slots+eid (промах)
+    ggml_tensor * cpu_map  = nullptr; // I32 [1, n_expert] CPU:  eid -> -1 (попадание: строка
+                                      // пропускается CPU mul_mat_id без чтения весов) | eid.
+                                      // Лежит в CPU-памяти намеренно: get_rows по нему — CPU-узел,
+                                      // он режет GPU-сплит и даёт перекрытие CPU/GPU (llama-graph.cpp)
+    ggml_tensor * mask     = nullptr; // F32 [1, n_expert] VRAM: 1.0 если eid в кэше
 
     // host-состояние
     std::vector<int32_t> slot_eid; // слот -> eid | -1
@@ -53,7 +56,8 @@ struct llama_h1ec {
     std::vector<llama_h1ec_layer> layers;
 
     ggml_context_ptr        ctx;
-    ggml_backend_buffer_ptr buf; // один VRAM-буфер: кэш-пул (внахлёст) + карты
+    ggml_backend_buffer_ptr buf;     // VRAM-буфер: кэш-пул (внахлёст) + slot_map/mask
+    ggml_backend_buffer_ptr buf_cpu; // CPU-буфер: cpu_map всех слоёв
 
     // выделяет пул на первом GPU-девайсе модели; false = кэш недоступен
     bool init(const llama_model & model, int32_t n_slots);
