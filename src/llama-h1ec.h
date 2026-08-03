@@ -48,6 +48,11 @@ struct llama_h1ec_layer {
     std::vector<int32_t> h_cpu;
     std::vector<float>   h_mask;
 
+    // автопилот: затухающие счётчики использования + стэш выбранных экспертов
+    // последнего декода (записывается при построении графа, читается post_decode)
+    std::vector<double>   score;
+    mutable ggml_tensor * sel_last = nullptr;
+
     bool enabled = false;
 };
 
@@ -69,6 +74,22 @@ struct llama_h1ec {
     // копирует срезы up/gate/down и обновляет карты на GPU
     bool assign(const llama_model & model, int32_t il, int32_t slot, int32_t eid);
 
+    // --- автопилот (менеджер в ядре) ---
+    // Включается ТОЛЬКО при env-инициализации (H1EC_SLOTS у любого штатного
+    // инструмента: llama-cli, llama-server...). Явный вызов llama_h1ec_init*
+    // из своего кода оставляет autopilot=false — политикой рулит вызывающий.
+    bool    autopilot    = false;
+    int32_t update_every = 16; // H1EC_UPDATE_EVERY
+    int32_t swap_budget  = 16; // H1EC_SWAPS
+    int32_t tokens_since_update = 0;
+    long long stat_hits = 0, stat_total = 0, stat_swaps = 0;
+
+    // вызывается из llama_context::decode после каждого h1-декода (n_tokens<=8):
+    // копит счётчики из sel_last, раз в update_every токенов — затухание и свопы
+    void post_decode(const llama_model & model, int32_t n_tokens);
+
+    ~llama_h1ec();
+
     const llama_h1ec_layer * get_layer(int il) const {
         if (il < 0 || (size_t) il >= layers.size() || !layers[il].enabled) {
             return nullptr;
@@ -78,4 +99,5 @@ struct llama_h1ec {
 
 private:
     void push_maps(const llama_h1ec_layer & l);
+    int  update_layer(const llama_model & model, int32_t il, int32_t budget);
 };

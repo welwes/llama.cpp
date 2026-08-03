@@ -231,6 +231,107 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
 }
 
 //
+// автопилот: менеджер кэша в ядре (порт политики из h1-expert-cache)
+//
+
+llama_h1ec::~llama_h1ec() {
+    if (autopilot && stat_total > 0) {
+        LLAMA_LOG_INFO("h1ec: hit rate %.1f%% (%lld/%lld), swaps %lld\n",
+                100.0 * stat_hits / stat_total, stat_hits, stat_total, stat_swaps);
+    }
+}
+
+// свопы слоя по счётчикам; гистерезис — кандидат заметно горячее жертвы, иначе пинг-понг
+int llama_h1ec::update_layer(const llama_model & model, int32_t il, int32_t budget) {
+    auto & l = layers[il];
+    if (l.score.empty()) {
+        return 0;
+    }
+    std::vector<int> order(l.score.size());
+    for (size_t i = 0; i < order.size(); i++) {
+        order[i] = (int) i;
+    }
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return l.score[a] > l.score[b]; });
+
+    int swaps = 0;
+    for (int rank = 0; rank < (int) order.size() && rank < l.n_slots && swaps < budget; rank++) {
+        const int eid = order[rank];
+        if (l.score[eid] <= 0.0 || l.h_mask[eid] > 0.0f) {
+            continue; // мёртвый или уже в кэше
+        }
+        int victim_slot = -1;
+        double victim_score = 1e300;
+        for (int s = 0; s < l.n_slots; s++) {
+            const int ve = l.slot_eid[s];
+            const double vs = ve < 0 ? -1.0 : l.score[ve];
+            if (vs < victim_score) {
+                victim_score = vs;
+                victim_slot  = s;
+            }
+        }
+        if (victim_slot < 0 || l.score[eid] < victim_score * 1.5 + 2.0) {
+            break;
+        }
+        if (!assign(model, il, victim_slot, eid)) {
+            break;
+        }
+        swaps++;
+    }
+    return swaps;
+}
+
+void llama_h1ec::post_decode(const llama_model & model, int32_t n_tokens) {
+    if (!autopilot) {
+        return;
+    }
+    std::vector<int32_t> ids;
+    for (size_t il = 0; il < layers.size(); il++) {
+        auto & l = layers[il];
+        if (!l.enabled || l.sel_last == nullptr) {
+            continue;
+        }
+        const int64_t n = ggml_nelements(l.sel_last);
+        ids.resize(n);
+        ggml_backend_tensor_get(l.sel_last, ids.data(), 0, n * sizeof(int32_t));
+        if (l.score.empty()) {
+            l.score.assign(n_expert, 0.0);
+        }
+        for (int64_t i = 0; i < n; i++) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= n_expert) {
+                continue;
+            }
+            l.score[e] += 1.0;
+            stat_total++;
+            if (l.h_mask[e] > 0.0f) {
+                stat_hits++;
+            }
+        }
+    }
+
+    tokens_since_update += n_tokens;
+    if (tokens_since_update < update_every) {
+        return;
+    }
+    tokens_since_update = 0;
+
+    for (auto & l : layers) {
+        for (auto & s : l.score) {
+            s *= 0.9; // полураспад ~7 апдейтов
+        }
+    }
+    int budget = swap_budget;
+    for (size_t il = 0; il < layers.size() && budget > 0; il++) {
+        if (!layers[il].enabled) {
+            continue;
+        }
+        const int done = update_layer(model, (int32_t) il, budget);
+        budget    -= done;
+        stat_swaps += done;
+    }
+}
+
+//
 // public C API
 //
 

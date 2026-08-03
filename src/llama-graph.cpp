@@ -2160,6 +2160,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (use_h1) {
         // topk может быть невыгружаемым видом — уплотняем
         ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used * n_tokens);
+        h1l->sel_last = sel_flat; // стэш для автопилота (читается в post_decode после compute)
 
         ggml_tensor * ids_gpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, h1l->slot_map, sel_flat), n_expert_used, n_tokens);
         ggml_tensor * ids_cpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, h1l->cpu_map,  sel_flat), n_expert_used, n_tokens);
