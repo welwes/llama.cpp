@@ -46,6 +46,11 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
         no_cpu_remap = true; // диагностика: CPU-ветка без ремапа, попадания с весом 0
         LLAMA_LOG_WARN("%s: H1EC_NO_CPU_REMAP=1 - CPU branch computes hits too (weight 0)\n", __func__);
     }
+    bool fat_pool = false;
+    if (const char * v = getenv("H1EC_FAT"); v && atoi(v) != 0) {
+        fat_pool = true; // диагностика: раскладка БЕЗ перекрытий (жирный пул — только на малом числе слоёв!)
+        LLAMA_LOG_WARN("%s: H1EC_FAT=1 - non-overlapping pool layout\n", __func__);
+    }
 
     const int n_layer = (int) model.layers.size();
     layers.resize(n_layer);
@@ -91,7 +96,9 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
             GGML_ASSERT(t->nb[2] == src->nb[2]); // одинаковый тип/размер среза эксперта
             off = h1ec_align(off);
             pend.push_back({ t, off });
-            off += (size_t) l.n_slots * t->nb[2]; // шаг БЕЗ хвоста — хвост внахлёст
+            // обычный шаг БЕЗ хвоста (хвост внахлёст со следующими тензорами);
+            // fat-режим — полный шаг, перекрытий нет (диагностика)
+            off += (size_t) (fat_pool ? l.n_slots + n_expert : l.n_slots) * t->nb[2];
             max_nb2 = std::max(max_nb2, (size_t) t->nb[2]);
             *dsts[k] = t;
         }
