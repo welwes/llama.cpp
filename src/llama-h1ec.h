@@ -81,6 +81,10 @@ struct llama_h1ec {
     bool    autopilot    = false;
     int32_t update_every = 16; // H1EC_UPDATE_EVERY
     int32_t swap_budget  = 16; // H1EC_SWAPS
+    // куда CPU-ветка редиректит попадания: -1 = скип строки (наш патч ggml-cpu),
+    // 0 = эксперт 0 с весом 0 (диагностический рубильник H1EC_CPU0=1 — если с ним
+    // мусор исчезает, значит в живом графе mmid идёт путём, где id<0 не поддержан)
+    int32_t cpu_hit_id   = -1;
     int32_t tokens_since_update = 0;
     long long stat_hits = 0, stat_total = 0, stat_swaps = 0;
 

@@ -38,6 +38,10 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
 
     n_slots  = max_slots;
     n_expert = (int32_t) model.hparams.n_expert;
+    if (const char * v = getenv("H1EC_CPU0"); v && atoi(v) != 0) {
+        cpu_hit_id = 0; // диагностика: попадания -> эксперт 0 вместо скипа id<0
+        LLAMA_LOG_WARN("%s: H1EC_CPU0=1 - hits redirect to expert 0 (no id<0 skip)\n", __func__);
+    }
 
     const int n_layer = (int) model.layers.size();
     layers.resize(n_layer);
@@ -221,7 +225,7 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
         }
 
         l.h_slot[eid] = slot;
-        l.h_cpu [eid] = -1;   // попадание: CPU mul_mat_id пропускает строку без чтения весов
+        l.h_cpu [eid] = cpu_hit_id; // -1 = скип строки | 0 = диагностический режим H1EC_CPU0
         l.h_mask[eid] = 1.0f;
         l.slot_eid[slot] = eid;
     }
