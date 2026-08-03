@@ -548,7 +548,10 @@ extern "C" {
     // llama_h1ec_assign — между вызовами llama_decode (кладёт эксперта в слот,
     // expert_id < 0 освобождает слот). Возврат false = не применилось.
     LLAMA_API bool    llama_h1ec_init    (struct llama_model * model, int32_t n_slots);
-    LLAMA_API int32_t llama_h1ec_n_slots (const struct llama_model * model);
+    // layer-aware бюджет: своя ёмкость каждому слою (0 = слой без кэша); n = число слоёв модели
+    LLAMA_API bool    llama_h1ec_init_layers(struct llama_model * model, const int32_t * slots_per_layer, int32_t n);
+    LLAMA_API int32_t llama_h1ec_n_slots (const struct llama_model * model); // максимум по слоям
+    LLAMA_API int32_t llama_h1ec_layer_slots(const struct llama_model * model, int32_t il);
     LLAMA_API bool    llama_h1ec_assign  (struct llama_model * model, int32_t il, int32_t slot, int32_t expert_id);
 
     LLAMA_API bool llama_supports_mmap       (void);

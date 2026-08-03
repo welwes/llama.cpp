@@ -11,8 +11,15 @@ static size_t h1ec_align(size_t off) {
     return (off + 63) & ~(size_t) 63;
 }
 
-bool llama_h1ec::init(const llama_model & model, int32_t n_slots_arg) {
-    if (n_slots_arg <= 0 || model.hparams.n_expert == 0) {
+bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & slots_per_layer) {
+    if (slots_per_layer.size() != model.layers.size() || model.hparams.n_expert == 0) {
+        return false;
+    }
+    int32_t max_slots = 0;
+    for (int32_t s : slots_per_layer) {
+        max_slots = std::max(max_slots, s);
+    }
+    if (max_slots <= 0) {
         return false;
     }
 
@@ -29,7 +36,7 @@ bool llama_h1ec::init(const llama_model & model, int32_t n_slots_arg) {
     }
     ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
 
-    n_slots  = n_slots_arg;
+    n_slots  = max_slots;
     n_expert = (int32_t) model.hparams.n_expert;
 
     const int n_layer = (int) model.layers.size();
@@ -59,9 +66,10 @@ bool llama_h1ec::init(const llama_model & model, int32_t n_slots_arg) {
         auto & l = layers[il];
 
         ggml_tensor * srcs[3] = { src_l.ffn_up_exps, src_l.ffn_gate_exps, src_l.ffn_down_exps };
-        if (!srcs[0] || !srcs[1] || !srcs[2]) {
-            continue; // не-MoE слой
+        if (!srcs[0] || !srcs[1] || !srcs[2] || slots_per_layer[il] <= 0) {
+            continue; // не-MoE слой или слой без бюджета
         }
+        l.n_slots = slots_per_layer[il];
         if (srcs[0]->ne[2] != n_expert || srcs[1]->ne[2] != n_expert || srcs[2]->ne[2] != n_expert) {
             continue;
         }
@@ -70,12 +78,12 @@ bool llama_h1ec::init(const llama_model & model, int32_t n_slots_arg) {
         const char * names[3] = { "up", "gate", "down" };
         for (int k = 0; k < 3; k++) {
             ggml_tensor * src = srcs[k];
-            ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), src->type, src->ne[0], src->ne[1], n_slots + n_expert);
+            ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), src->type, src->ne[0], src->ne[1], l.n_slots + n_expert);
             ggml_format_name(t, "h1ec.%d.%s", il, names[k]);
             GGML_ASSERT(t->nb[2] == src->nb[2]); // одинаковый тип/размер среза эксперта
             off = h1ec_align(off);
             pend.push_back({ t, off });
-            off += (size_t) n_slots * t->nb[2]; // шаг БЕЗ хвоста — хвост внахлёст
+            off += (size_t) l.n_slots * t->nb[2]; // шаг БЕЗ хвоста — хвост внахлёст
             max_nb2 = std::max(max_nb2, (size_t) t->nb[2]);
             *dsts[k] = t;
         }
@@ -150,12 +158,12 @@ bool llama_h1ec::init(const llama_model & model, int32_t n_slots_arg) {
         if (!l.enabled) {
             continue;
         }
-        l.slot_eid.assign(n_slots, -1);
+        l.slot_eid.assign(l.n_slots, -1);
         l.h_slot.resize(n_expert);
         l.h_cpu.resize(n_expert);
         l.h_mask.assign(n_expert, 0.0f);
         for (int e = 0; e < n_expert; e++) {
-            l.h_slot[e] = n_slots + e; // всё промах
+            l.h_slot[e] = l.n_slots + e; // всё промах
             l.h_cpu [e] = e;
         }
         push_maps(l);
@@ -176,10 +184,10 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
     if (il < 0 || (size_t) il >= layers.size() || !layers[il].enabled) {
         return false;
     }
-    if (slot < 0 || slot >= n_slots || eid >= n_expert) {
+    auto & l = layers[il];
+    if (slot < 0 || slot >= l.n_slots || eid >= n_expert) {
         return false;
     }
-    auto & l = layers[il];
 
     if (l.slot_eid[slot] == eid) {
         return true;
@@ -187,7 +195,7 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
 
     // выселить прежнего жильца слота
     if (const int32_t old = l.slot_eid[slot]; old >= 0) {
-        l.h_slot[old] = n_slots + old;
+        l.h_slot[old] = l.n_slots + old;
         l.h_cpu [old] = old;
         l.h_mask[old] = 0.0f;
         l.slot_eid[slot] = -1;
@@ -195,7 +203,7 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
 
     if (eid >= 0) {
         // эксперт уже сидит в другом слоте — освободить его там
-        for (int s = 0; s < n_slots; s++) {
+        for (int s = 0; s < l.n_slots; s++) {
             if (l.slot_eid[s] == eid) {
                 l.slot_eid[s] = -1;
             }
@@ -229,11 +237,27 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
 #include "llama.h"
 
 bool llama_h1ec_init(struct llama_model * model, int32_t n_slots) {
+    if (model == nullptr) {
+        return false;
+    }
+    return llama_h1ec_init_layers(model, nullptr, n_slots);
+}
+
+bool llama_h1ec_init_layers(struct llama_model * model, const int32_t * slots_per_layer, int32_t n) {
     if (model == nullptr || model->h1ec) {
         return false;
     }
+    std::vector<int32_t> slots;
+    if (slots_per_layer == nullptr) {
+        slots.assign(model->layers.size(), n); // n = единая ёмкость
+    } else {
+        if ((size_t) n != model->layers.size()) {
+            return false;
+        }
+        slots.assign(slots_per_layer, slots_per_layer + n);
+    }
     auto h1ec = std::make_unique<llama_h1ec>();
-    if (!h1ec->init(*model, n_slots)) {
+    if (!h1ec->init(*model, slots)) {
         return false;
     }
     model->h1ec = std::move(h1ec);
@@ -242,6 +266,13 @@ bool llama_h1ec_init(struct llama_model * model, int32_t n_slots) {
 
 int32_t llama_h1ec_n_slots(const struct llama_model * model) {
     return model && model->h1ec ? model->h1ec->n_slots : 0;
+}
+
+int32_t llama_h1ec_layer_slots(const struct llama_model * model, int32_t il) {
+    if (model == nullptr || !model->h1ec || il < 0 || (size_t) il >= model->h1ec->layers.size()) {
+        return 0;
+    }
+    return model->h1ec->layers[il].n_slots;
 }
 
 bool llama_h1ec_assign(struct llama_model * model, int32_t il, int32_t slot, int32_t expert_id) {

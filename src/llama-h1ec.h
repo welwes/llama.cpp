@@ -28,6 +28,8 @@
 struct llama_model;
 
 struct llama_h1ec_layer {
+    int32_t n_slots = 0; // ёмкость слоя (layer-aware бюджет — слоям с плохим reuse больше)
+
     // [n_embd, n_ff_exp, n_slots + n_expert] — хвост n_expert = мусор для промахов
     ggml_tensor * cache_up   = nullptr;
     ggml_tensor * cache_gate = nullptr;
@@ -50,7 +52,7 @@ struct llama_h1ec_layer {
 };
 
 struct llama_h1ec {
-    int32_t n_slots  = 0;
+    int32_t n_slots  = 0; // максимум по слоям (для справки; ёмкость слоя — layers[il].n_slots)
     int32_t n_expert = 0;
 
     std::vector<llama_h1ec_layer> layers;
@@ -59,8 +61,9 @@ struct llama_h1ec {
     ggml_backend_buffer_ptr buf;     // VRAM-буфер: кэш-пул (внахлёст) + slot_map/mask
     ggml_backend_buffer_ptr buf_cpu; // CPU-буфер: cpu_map всех слоёв
 
-    // выделяет пул на первом GPU-девайсе модели; false = кэш недоступен
-    bool init(const llama_model & model, int32_t n_slots);
+    // выделяет пул на первом GPU-девайсе модели; false = кэш недоступен.
+    // slots_per_layer: ёмкость каждого слоя (0 = слой без кэша); размер = число слоёв модели
+    bool init(const llama_model & model, const std::vector<int32_t> & slots_per_layer);
 
     // положить эксперта eid в слот slot слоя il (eid < 0 = освободить слот);
     // копирует срезы up/gate/down и обновляет карты на GPU
