@@ -195,6 +195,25 @@ void llama_h1ec::push_maps(const llama_h1ec_layer & l) {
     ggml_backend_tensor_set(l.mask,     l.h_mask.data(), 0, l.h_mask.size() * sizeof(float));
 }
 
+void llama_h1ec::set_bypass(bool on) {
+    std::vector<int32_t> ident(n_expert);
+    std::vector<float>   zeros(n_expert, 0.0f);
+    for (int e = 0; e < n_expert; e++) {
+        ident[e] = e;
+    }
+    for (auto & l : layers) {
+        if (!l.enabled) {
+            continue;
+        }
+        if (on) {
+            ggml_backend_tensor_set(l.cpu_map, ident.data(), 0, ident.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(l.mask,    zeros.data(), 0, zeros.size() * sizeof(float));
+        } else {
+            push_maps(l); // вернуть реальные карты
+        }
+    }
+}
+
 bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int32_t eid) {
     if (il < 0 || (size_t) il >= layers.size() || !layers[il].enabled) {
         return false;
@@ -398,4 +417,10 @@ bool llama_h1ec_assign(struct llama_model * model, int32_t il, int32_t slot, int
         return false;
     }
     return model->h1ec->assign(*model, il, slot, expert_id);
+}
+
+void llama_h1ec_bypass(struct llama_model * model, bool on) {
+    if (model && model->h1ec) {
+        model->h1ec->set_bypass(on);
+    }
 }

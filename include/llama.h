@@ -553,6 +553,8 @@ extern "C" {
     LLAMA_API int32_t llama_h1ec_n_slots (const struct llama_model * model); // максимум по слоям
     LLAMA_API int32_t llama_h1ec_layer_slots(const struct llama_model * model, int32_t il);
     LLAMA_API bool    llama_h1ec_assign  (struct llama_model * model, int32_t il, int32_t slot, int32_t expert_id);
+    // обход кэша без его потери (нулевые маски): для численной верификации
+    LLAMA_API void    llama_h1ec_bypass  (struct llama_model * model, bool on);
 
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);

@@ -96,6 +96,11 @@ struct llama_h1ec {
     // копит счётчики из sel_last, раз в update_every токенов — затухание и свопы
     void post_decode(const llama_model & model, int32_t n_tokens);
 
+    // обход кэша БЕЗ его потери: on=true пушит нулевые маски + identity cpu_map
+    // (всё считается стоковым CPU-путём), on=false возвращает реальные карты.
+    // Для численной верификации: логиты с кэшем обязаны совпадать с логитами без
+    void set_bypass(bool on);
+
     ~llama_h1ec();
 
     const llama_h1ec_layer * get_layer(int il) const {
