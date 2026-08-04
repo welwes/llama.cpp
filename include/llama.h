@@ -555,6 +555,8 @@ extern "C" {
     LLAMA_API bool    llama_h1ec_assign  (struct llama_model * model, int32_t il, int32_t slot, int32_t expert_id);
     // обход кэша без его потери (нулевые маски): для численной верификации
     LLAMA_API void    llama_h1ec_bypass  (struct llama_model * model, bool on);
+    // дождаться асинхронных заливок assign (звать после пачки; декод страхуется сам)
+    LLAMA_API void    llama_h1ec_flush   (struct llama_model * model);
 
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);

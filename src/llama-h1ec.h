@@ -66,6 +66,15 @@ struct llama_h1ec {
     ggml_backend_buffer_ptr buf;     // VRAM-буфер: кэш-пул (внахлёст) + slot_map/mask
     ggml_backend_buffer_ptr buf_cpu; // CPU-буфер: cpu_map всех слоёв
 
+    // собственный бэкенд для асинхронной заливки срезов (отдельный CUDA-стрим);
+    // источники — pinned-память модели, копии летят без стейджинга, sync = flush()
+    ggml_backend_ptr backend_async;
+    bool             dirty = false; // есть незавершённые async-копии
+
+    // дождаться всех async-заливок; ОБЯЗАН случиться до следующего графа
+    // (llama_context::decode вызывает сам как страховку)
+    void flush();
+
     // выделяет пул на первом GPU-девайсе модели; false = кэш недоступен.
     // slots_per_layer: ёмкость каждого слоя (0 = слой без кэша); размер = число слоёв модели
     bool init(const llama_model & model, const std::vector<int32_t> & slots_per_layer);

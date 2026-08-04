@@ -1703,6 +1703,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    // H1EC: страховка — незавершённые async-заливки кэша обязаны сесть до графа
+    if (model.h1ec && model.h1ec->dirty) {
+        model.h1ec->flush();
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

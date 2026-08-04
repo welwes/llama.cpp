@@ -196,6 +196,9 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
     // нули: любой квант из нулевых байтов декодируется в 0 (случайный мусор мог бы дать NaN)
     ggml_backend_buffer_clear(buf.get(), 0);
 
+    // отдельный бэкенд (свой CUDA-стрим) для асинхронной заливки срезов
+    backend_async.reset(ggml_backend_dev_init(dev, nullptr));
+
     for (auto & l : layers) {
         if (!l.enabled) {
             continue;
@@ -276,9 +279,17 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
         std::vector<uint8_t> staging;
         for (int k = 0; k < 3; k++) {
             const size_t nb2 = srcs[k]->nb[2];
-            staging.resize(nb2);
-            ggml_backend_tensor_get(srcs[k], staging.data(), (size_t) eid  * nb2, nb2);
-            ggml_backend_tensor_set(dsts[k], staging.data(), (size_t) slot * nb2, nb2);
+            // веса модели в host-памяти (pinned при -ngl) — async H2D прямо из них,
+            // без стейджинга; sync один на пачку (flush перед следующим графом)
+            if (backend_async && srcs[k]->buffer && ggml_backend_buffer_is_host(srcs[k]->buffer)) {
+                ggml_backend_tensor_set_async(backend_async.get(), dsts[k],
+                        (const char *) srcs[k]->data + (size_t) eid * nb2, (size_t) slot * nb2, nb2);
+                dirty = true;
+            } else {
+                staging.resize(nb2);
+                ggml_backend_tensor_get(srcs[k], staging.data(), (size_t) eid  * nb2, nb2);
+                ggml_backend_tensor_set(dsts[k], staging.data(), (size_t) slot * nb2, nb2);
+            }
         }
 
         l.h_slot[eid] = slot;
@@ -298,9 +309,17 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
 //
 
 llama_h1ec::~llama_h1ec() {
+    flush();
     if (autopilot && stat_total > 0) {
         LLAMA_LOG_INFO("h1ec: hit rate %.1f%% (%lld/%lld), swaps %lld\n",
                 100.0 * stat_hits / stat_total, stat_hits, stat_total, stat_swaps);
+    }
+}
+
+void llama_h1ec::flush() {
+    if (dirty && backend_async) {
+        ggml_backend_synchronize(backend_async.get());
+        dirty = false;
     }
 }
 
@@ -392,6 +411,7 @@ void llama_h1ec::post_decode(const llama_model & model, int32_t n_tokens) {
         budget    -= done;
         stat_swaps += done;
     }
+    flush(); // все async-заливки пачки должны сесть до следующего графа
 }
 
 //
@@ -449,5 +469,11 @@ bool llama_h1ec_assign(struct llama_model * model, int32_t il, int32_t slot, int
 void llama_h1ec_bypass(struct llama_model * model, bool on) {
     if (model && model->h1ec) {
         model->h1ec->set_bypass(on);
+    }
+}
+
+void llama_h1ec_flush(struct llama_model * model) {
+    if (model && model->h1ec) {
+        model->h1ec->flush();
     }
 }
