@@ -309,10 +309,13 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
         open_blob(model, bp);
     }
 
-    // --- M1.3: префетч (деф. включён; H1EC_PREFETCH=0 — синхронные заливки) ---
+    // --- M1.3: префетч (деф. ВЫКЛ — замер 04.08: на бюджетном NVMe с CPU-bound
+    // декодом фоновый IO конкурирует с mmap-чтениями критического пути и отъедает
+    // ядро у матмулов, 6.3→5.0 t/s; включать H1EC_PREFETCH=1 на конфигурациях,
+    // где доминируют заливки кэша, а не чтения декода) ---
     {
         const char * v = getenv("H1EC_PREFETCH");
-        prefetch_on = (v == nullptr || *v == '\0' || atoi(v) != 0);
+        prefetch_on = (v != nullptr && atoi(v) != 0);
     }
     if (prefetch_on) {
         pf_model  = &model;
