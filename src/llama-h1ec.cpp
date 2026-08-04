@@ -225,12 +225,20 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
         return false;
     }
     if (off_ram > 0) {
-        // pinned host если есть; фолбэк — обычная CPU-память (медленнее H2D, но работает)
-        ggml_backend_buffer_type_t ram_buft = ggml_backend_dev_host_buffer_type(dev);
-        if (ram_buft == nullptr) {
-            ram_buft = ggml_backend_dev_buffer_type(cpu_dev);
+        // page-locked память берём у GPU-девайса (CUDA_Host), но тензоры заводим в
+        // CPU-обёртке над теми же страницами: тип буфера решает, какой бэкенд
+        // считает op, а RAM-ветка обязана идти на CPU (id=-1 скип только там)
+        ggml_backend_buffer_type_t pin_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (pin_buft != nullptr) {
+            buf_ram_pin.reset(ggml_backend_buft_alloc_buffer(pin_buft, off_ram));
         }
-        buf_ram.reset(ggml_backend_buft_alloc_buffer(ram_buft, off_ram));
+        if (buf_ram_pin) {
+            buf_ram.reset(ggml_backend_cpu_buffer_from_ptr(
+                    ggml_backend_buffer_get_base(buf_ram_pin.get()), off_ram));
+        } else {
+            // фолбэк: обычная CPU-память (может уйти в своп под давлением RAM)
+            buf_ram.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(cpu_dev), off_ram));
+        }
         if (!buf_ram) {
             LLAMA_LOG_WARN("%s: RAM tier alloc failed (%.0f MiB) — tier disabled\n", __func__, off_ram / 1048576.0);
             for (auto & l : layers) {
@@ -238,6 +246,9 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
                 l.ram_up = l.ram_gate = l.ram_down = nullptr;
             }
             pend_ram.clear();
+        } else {
+            LLAMA_LOG_INFO("%s: RAM tier %.0f MiB (%s)\n", __func__, off_ram / 1048576.0,
+                    buf_ram_pin ? "page-locked" : "pageable");
         }
     }
 

@@ -88,7 +88,12 @@ struct llama_h1ec {
     bool             dirty = false; // есть незавершённые async-копии
 
     // --- M1: RAM-ярус + эксперт-блоб ---
-    ggml_backend_buffer_ptr buf_ram; // pinned host пул RAM-яруса (свопу недоступен)
+    // Память держит buf_ram_pin (CUDA_Host = page-locked, свопу недоступна, H2D
+    // быстрый), а ТЕНЗОРЫ живут в buf_ram — CPU-обёртке над теми же страницами:
+    // иначе планировщик по типу буфера отдал бы RAM-ветку CUDA, где id=-1 не
+    // поддержан (найдено 04.08: NaN с первого декода фазы A)
+    ggml_backend_buffer_ptr buf_ram_pin;
+    ggml_backend_buffer_ptr buf_ram;
     FILE *  blob = nullptr;          // H1EC_BLOB: эксперт-блоб (h1-blob-pack)
     struct blob_layer {
         uint64_t base = 0, up = 0, gate = 0, down = 0; // офсет и размеры срезов
