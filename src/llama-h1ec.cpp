@@ -270,6 +270,16 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
         }
     }
 
+    // ПОМЕТКА WEIGHTS обязательна: только для weight-буферов планировщик прибивает
+    // op к бэкенду буфера src0. Без неё листья висят с backend=NULL и sched по
+    // эвристике утаскивает CPU-ветки на CUDA с копированием тензоров (NaN + тормоза;
+    // найдено по GGML_SCHED_DEBUG-дампу 04.08)
+    ggml_backend_buffer_set_usage(buf.get(),     GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_usage(buf_cpu.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (buf_ram) {
+        ggml_backend_buffer_set_usage(buf_ram.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+
     // нули: любой квант из нулевых байтов декодируется в 0 (случайный мусор мог бы дать NaN)
     ggml_backend_buffer_clear(buf.get(), 0);
 
