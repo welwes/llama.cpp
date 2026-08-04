@@ -23,6 +23,7 @@
 #include "ggml-cpp.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 struct llama_model;
@@ -34,6 +35,16 @@ struct llama_h1ec_layer {
     ggml_tensor * cache_up   = nullptr;
     ggml_tensor * cache_gate = nullptr;
     ggml_tensor * cache_down = nullptr;
+
+    // --- RAM-ярус (M1.2): pinned-host кэш экспертов, спасает от mmap/SSD ---
+    // Хвостов/мусора НЕТ: промахи RAM-ветки идут в id=-1 (CPU-скип строк)
+    int32_t ram_slots = 0;
+    ggml_tensor * ram_up   = nullptr; // [n_embd, n_ff_exp, ram_slots], pinned host
+    ggml_tensor * ram_gate = nullptr;
+    ggml_tensor * ram_down = nullptr;
+    ggml_tensor * ram_map  = nullptr; // I32 [1,n_expert] CPU: eid -> ram-слот | -1
+                                      // (-1 и когда эксперт в VRAM — ярусы эксклюзивны по маскам)
+    ggml_tensor * mask_ram = nullptr; // F32 [1,n_expert] VRAM: 1.0 если считает RAM-ярус
 
     ggml_tensor * slot_map = nullptr; // I32 [1, n_expert] VRAM: eid -> слот | n_slots+eid (промах)
     ggml_tensor * cpu_map  = nullptr; // I32 [1, n_expert] CPU:  eid -> -1 (попадание: строка
@@ -47,6 +58,11 @@ struct llama_h1ec_layer {
     std::vector<int32_t> h_slot;
     std::vector<int32_t> h_cpu;
     std::vector<float>   h_mask;
+
+    // RAM-ярус
+    std::vector<int32_t> ram_slot_eid; // ram-слот -> eid | -1
+    std::vector<int32_t> h_ram;        // eid -> ram-слот | -1 (эксклюзивно с VRAM)
+    std::vector<float>   h_mask_ram;
 
     // автопилот: затухающие счётчики использования + стэш выбранных экспертов
     // последнего декода (записывается при построении графа, читается post_decode)
@@ -71,6 +87,14 @@ struct llama_h1ec {
     ggml_backend_ptr backend_async;
     bool             dirty = false; // есть незавершённые async-копии
 
+    // --- M1: RAM-ярус + эксперт-блоб ---
+    ggml_backend_buffer_ptr buf_ram; // pinned host пул RAM-яруса (свопу недоступен)
+    FILE *  blob = nullptr;          // H1EC_BLOB: эксперт-блоб (h1-blob-pack)
+    struct blob_layer {
+        uint64_t base = 0, up = 0, gate = 0, down = 0; // офсет и размеры срезов
+    };
+    std::vector<blob_layer> blob_index; // по слоям модели (base=0 => слоя в блобе нет)
+
     // дождаться всех async-заливок; ОБЯЗАН случиться до следующего графа
     // (llama_context::decode вызывает сам как страховку)
     void flush();
@@ -82,6 +106,10 @@ struct llama_h1ec {
     // положить эксперта eid в слот slot слоя il (eid < 0 = освободить слот);
     // копирует срезы up/gate/down и обновляет карты на GPU
     bool assign(const llama_model & model, int32_t il, int32_t slot, int32_t eid);
+
+    // RAM-ярус: положить эксперта в ram-слот (источник: блоб — 1 seq-read,
+    // иначе mmap модели — 3 случайных чтения); маски эксклюзивны с VRAM
+    bool assign_ram(const llama_model & model, int32_t il, int32_t slot, int32_t eid);
 
     // --- автопилот (менеджер в ядре) ---
     // Включается ТОЛЬКО при env-инициализации (H1EC_SLOTS у любого штатного
@@ -121,5 +149,6 @@ struct llama_h1ec {
 
 private:
     void push_maps(const llama_h1ec_layer & l);
+    void open_blob(const llama_model & model, const char * path);
     int  update_layer(const llama_model & model, int32_t il, int32_t budget);
 };

@@ -2172,18 +2172,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(ids_cpu, "h1ec_ids_cpu", il);
 
         ggml_tensor * w_gpu = ggml_mul(ctx0, weights, m_hit); // веса промахов занулены
-        ggml_tensor * w_cpu = ggml_sub(ctx0, weights, w_gpu); // веса попаданий занулены
 
-        // Порядок узлов = порядок сплитов планировщика. cpu_map лежит в CPU-памяти,
-        // поэтому ids_cpu — CPU-узел; закрепив его МЕЖДУ гейтингом и кэш-цепочкой,
-        // получаем сплиты [GPU гейтинг+веса][CPU ids][GPU кэш][CPU эксперты][GPU add]:
-        // CPU-эксперты стартуют, дождавшись лишь короткого сплита ids, и считаются
-        // ПАРАЛЛЕЛЬНО с кэш-цепочкой на GPU (одна очередь CUDA, событие после ids).
+        // RAM-ярус (M1.2): третья ветка — pinned-host кэш экспертов; промахи
+        // яруса идут в id=-1 (CPU-скип строк), мусорных столбцов не нужно
+        ggml_tensor * ids_ram = nullptr;
+        ggml_tensor * w_ram   = nullptr;
+        if (h1l->ram_up != nullptr) {
+            ids_ram = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, h1l->ram_map, sel_flat), n_expert_used, n_tokens);
+            ggml_tensor * m_ram = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, h1l->mask_ram, sel_flat), 1, n_expert_used, n_tokens);
+            w_ram = ggml_mul(ctx0, weights, m_ram);
+        }
+        ggml_tensor * w_cpu = ggml_sub(ctx0, weights, w_gpu); // веса чужих ярусов занулены
+        if (w_ram != nullptr) {
+            w_cpu = ggml_sub(ctx0, w_cpu, w_ram);
+        }
+
+        // Порядок узлов = порядок сплитов планировщика. cpu_map/ram_map лежат в
+        // CPU-памяти, поэтому их get_rows — CPU-узлы; закрепив их МЕЖДУ гейтингом
+        // и кэш-цепочкой, получаем сплиты [GPU гейтинг+веса][CPU ids][GPU кэш]
+        // [CPU эксперты][GPU add]: CPU-ветки стартуют после короткого сплита ids
+        // и считаются ПАРАЛЛЕЛЬНО с кэш-цепочкой на GPU.
         ggml_build_forward_expand(gf, w_gpu);
+        if (w_ram != nullptr) {
+            ggml_build_forward_expand(gf, w_ram);
+        }
         ggml_build_forward_expand(gf, w_cpu);
         ggml_build_forward_expand(gf, ids_cpu);
+        if (ids_ram != nullptr) {
+            ggml_build_forward_expand(gf, ids_ram);
+        }
 
         ggml_tensor * e_gpu = expert_chain(cur, ids_gpu, w_gpu, nullptr, h1l->cache_up, h1l->cache_gate, h1l->cache_down);
+        if (ids_ram != nullptr) {
+            ggml_tensor * e_ram = expert_chain(cur, ids_ram, w_ram, nullptr, h1l->ram_up, h1l->ram_gate, h1l->ram_down);
+            e_gpu = ggml_add(ctx0, e_gpu, e_ram);
+        }
         ggml_tensor * e_cpu = expert_chain(cur, ids_cpu, w_cpu, nullptr, up_exps, gate_exps, down_exps);
 
         experts = ggml_add(ctx0, e_gpu, e_cpu);

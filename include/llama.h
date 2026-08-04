@@ -557,6 +557,10 @@ extern "C" {
     LLAMA_API void    llama_h1ec_bypass  (struct llama_model * model, bool on);
     // дождаться асинхронных заливок assign (звать после пачки; декод страхуется сам)
     LLAMA_API void    llama_h1ec_flush   (struct llama_model * model);
+    // RAM-ярус (M1.2): pinned-host кэш экспертов, включается env H1EC_RAM_MB;
+    // источник заливки — эксперт-блоб (env H1EC_BLOB, файл от h1-blob-pack) или mmap
+    LLAMA_API bool    llama_h1ec_assign_ram(struct llama_model * model, int32_t il, int32_t slot, int32_t expert_id);
+    LLAMA_API int32_t llama_h1ec_layer_ram_slots(const struct llama_model * model, int32_t il);
 
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
