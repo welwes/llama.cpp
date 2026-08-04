@@ -151,6 +151,7 @@ private:
     void pf_worker();
     bool read_expert(const llama_model & model, int32_t il, int32_t eid, std::vector<uint8_t> & out);
 
+public:
     // --- автопилот (менеджер в ядре) ---
     // Включается ТОЛЬКО при env-инициализации (H1EC_SLOTS у любого штатного
     // инструмента: llama-cli, llama-server...). Явный вызов llama_h1ec_init*
@@ -187,8 +188,8 @@ private:
         return &layers[il];
     }
 
+private:
     void push_maps(const llama_h1ec_layer & l);
     void open_blob(const llama_model & model, const char * path);
     int  update_layer(const llama_model & model, int32_t il, int32_t budget);
-    bool store_expert(const llama_model & model, int32_t il, int32_t eid, int tier, const uint8_t * data);
 };
