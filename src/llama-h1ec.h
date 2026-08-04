@@ -22,8 +22,12 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 struct llama_model;
@@ -109,12 +113,43 @@ struct llama_h1ec {
     bool init(const llama_model & model, const std::vector<int32_t> & slots_per_layer);
 
     // положить эксперта eid в слот slot слоя il (eid < 0 = освободить слот);
-    // копирует срезы up/gate/down и обновляет карты на GPU
-    bool assign(const llama_model & model, int32_t il, int32_t slot, int32_t eid);
+    // копирует срезы up/gate/down и обновляет карты на GPU.
+    // src_data != nullptr — готовые байты up|gate|down (из префетч-стейджинга)
+    bool assign(const llama_model & model, int32_t il, int32_t slot, int32_t eid,
+                const uint8_t * src_data = nullptr);
 
     // RAM-ярус: положить эксперта в ram-слот (источник: блоб — 1 seq-read,
     // иначе mmap модели — 3 случайных чтения); маски эксклюзивны с VRAM
-    bool assign_ram(const llama_model & model, int32_t il, int32_t slot, int32_t eid);
+    bool assign_ram(const llama_model & model, int32_t il, int32_t slot, int32_t eid,
+                    const uint8_t * src_data = nullptr);
+
+    // --- M1.3: префетч — фоновый IO-поток + двухфазный коммит ---
+    // request() ставит эксперта в очередь чтения (диск читается ПАРАЛЛЕЛЬНО
+    // декоду), commit_ready() в безопасной точке (между декодами) переносит
+    // готовые данные в тензоры/карты. Жертву слота выбирает коммит.
+    void request(int32_t il, int32_t eid, int tier); // tier: 0 = VRAM, 1 = RAM
+    int  commit_ready(const llama_model & model);    // вернёт число закоммиченных
+
+    bool prefetch_on = false; // H1EC_PREFETCH (деф. 1 при наличии блоба)
+
+private:
+    struct pf_item {
+        int32_t il = -1, eid = -1;
+        int     tier = 0;
+        std::vector<uint8_t> data; // up|gate|down подряд (байты срезов слоя)
+        bool    ok = false;
+    };
+    std::thread              pf_thread;
+    std::mutex               pf_mutex;   // очередь+готовые
+    std::condition_variable  pf_cv;
+    std::deque<pf_item>      pf_queue;
+    std::deque<pf_item>      pf_done;
+    bool                     pf_stop = false;
+    std::mutex               io_mutex;   // сериализация чтений блоба (FILE* один)
+    const llama_model *      pf_model = nullptr; // для mmap-фолбэка в воркере
+
+    void pf_worker();
+    bool read_expert(const llama_model & model, int32_t il, int32_t eid, std::vector<uint8_t> & out);
 
     // --- автопилот (менеджер в ядре) ---
     // Включается ТОЛЬКО при env-инициализации (H1EC_SLOTS у любого штатного
@@ -152,8 +187,8 @@ struct llama_h1ec {
         return &layers[il];
     }
 
-private:
     void push_maps(const llama_h1ec_layer & l);
     void open_blob(const llama_model & model, const char * path);
     int  update_layer(const llama_model & model, int32_t il, int32_t budget);
+    bool store_expert(const llama_model & model, int32_t il, int32_t eid, int tier, const uint8_t * data);
 };

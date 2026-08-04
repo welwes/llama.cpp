@@ -309,6 +309,17 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
         open_blob(model, bp);
     }
 
+    // --- M1.3: префетч (деф. включён; H1EC_PREFETCH=0 — синхронные заливки) ---
+    {
+        const char * v = getenv("H1EC_PREFETCH");
+        prefetch_on = (v == nullptr || *v == '\0' || atoi(v) != 0);
+    }
+    if (prefetch_on) {
+        pf_model  = &model;
+        pf_thread = std::thread(&llama_h1ec::pf_worker, this);
+        LLAMA_LOG_INFO("%s: prefetch worker started\n", __func__);
+    }
+
     LLAMA_LOG_INFO("%s: %d slots x %d layers, pool %.2f MiB on %s\n",
             __func__, n_slots, n_enabled, off / 1024.0 / 1024.0, ggml_backend_dev_name(dev));
     return true;
@@ -404,7 +415,8 @@ void llama_h1ec::set_bypass(bool on) {
     }
 }
 
-bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int32_t eid) {
+bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int32_t eid,
+                        const uint8_t * src_data) {
     if (il < 0 || (size_t) il >= layers.size() || !layers[il].enabled) {
         return false;
     }
@@ -443,11 +455,16 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
         ggml_tensor * srcs[3] = { src_l.ffn_up_exps, src_l.ffn_gate_exps, src_l.ffn_down_exps };
         ggml_tensor * dsts[3] = { l.cache_up, l.cache_gate, l.cache_down };
         std::vector<uint8_t> staging;
+        size_t data_off = 0;
         for (int k = 0; k < 3; k++) {
             const size_t nb2 = srcs[k]->nb[2];
-            // веса модели в host-памяти (pinned при -ngl) — async H2D прямо из них,
-            // без стейджинга; sync один на пачку (flush перед следующим графом)
-            if (backend_async && srcs[k]->buffer && ggml_backend_buffer_is_host(srcs[k]->buffer)) {
+            if (src_data != nullptr) {
+                // готовые байты из префетч-стейджинга (up|gate|down подряд)
+                ggml_backend_tensor_set(dsts[k], src_data + data_off, (size_t) slot * nb2, nb2);
+                data_off += nb2;
+            } else if (backend_async && srcs[k]->buffer && ggml_backend_buffer_is_host(srcs[k]->buffer)) {
+                // веса модели в host-памяти (pinned при -ngl) — async H2D прямо из них,
+                // без стейджинга; sync один на пачку (flush перед следующим графом)
                 ggml_backend_tensor_set_async(backend_async.get(), dsts[k],
                         (const char *) srcs[k]->data + (size_t) eid * nb2, (size_t) slot * nb2, nb2);
                 dirty = true;
@@ -471,7 +488,8 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
     return true;
 }
 
-bool llama_h1ec::assign_ram(const llama_model & model, int32_t il, int32_t slot, int32_t eid) {
+bool llama_h1ec::assign_ram(const llama_model & model, int32_t il, int32_t slot, int32_t eid,
+                            const uint8_t * src_data) {
     if (il < 0 || (size_t) il >= layers.size() || !layers[il].enabled) {
         return false;
     }
@@ -504,8 +522,18 @@ bool llama_h1ec::assign_ram(const llama_model & model, int32_t il, int32_t slot,
         ggml_tensor * srcs[3] = { src_l.ffn_up_exps, src_l.ffn_gate_exps, src_l.ffn_down_exps };
         ggml_tensor * dsts[3] = { l.ram_up, l.ram_gate, l.ram_down };
         const blob_layer be = (blob && !blob_index.empty()) ? blob_index[il] : blob_layer{};
-        if (blob && be.base > 0) {
+        if (src_data != nullptr) {
+            // готовые байты из префетч-стейджинга
+            size_t data_off = 0;
+            for (int k = 0; k < 3; k++) {
+                const size_t nb2 = srcs[k]->nb[2];
+                memcpy((char *) dsts[k]->data + (size_t) slot * nb2, src_data + data_off, nb2);
+                data_off += nb2;
+            }
+        } else if (blob && be.base > 0) {
             // блоб: ОДНО последовательное чтение всего эксперта прямо в host-тензоры
+            // (io_mutex: FILE* делится с префетч-воркером)
+            std::lock_guard<std::mutex> io_lock(io_mutex);
             const uint64_t bsz = be.up + be.gate + be.down;
             if (h1_fseek64(blob, (int64_t) (be.base + (uint64_t) eid * bsz), SEEK_SET) != 0) {
                 return false;
@@ -540,10 +568,136 @@ bool llama_h1ec::assign_ram(const llama_model & model, int32_t il, int32_t slot,
 }
 
 //
+// M1.3: префетч — фоновый IO-поток + двухфазный коммит
+//
+
+bool llama_h1ec::read_expert(const llama_model & model, int32_t il, int32_t eid, std::vector<uint8_t> & out) {
+    const auto & src_l = model.layers[il];
+    ggml_tensor * srcs[3] = { src_l.ffn_up_exps, src_l.ffn_gate_exps, src_l.ffn_down_exps };
+    const size_t total = srcs[0]->nb[2] + srcs[1]->nb[2] + srcs[2]->nb[2];
+    out.resize(total);
+
+    const blob_layer be = (blob && !blob_index.empty()) ? blob_index[il] : blob_layer{};
+    if (blob && be.base > 0) {
+        std::lock_guard<std::mutex> io_lock(io_mutex);
+        const uint64_t bsz = be.up + be.gate + be.down;
+        if (h1_fseek64(blob, (int64_t) (be.base + (uint64_t) eid * bsz), SEEK_SET) != 0) {
+            return false;
+        }
+        return fread(out.data(), 1, total, blob) == total;
+    }
+    // mmap-фолбэк: page faults случаются в ЭТОМ (фоновом) потоке, декод не блокируется
+    size_t off = 0;
+    for (int k = 0; k < 3; k++) {
+        const size_t nb2 = srcs[k]->nb[2];
+        memcpy(out.data() + off, (const char *) srcs[k]->data + (size_t) eid * nb2, nb2);
+        off += nb2;
+    }
+    return true;
+}
+
+void llama_h1ec::pf_worker() {
+    for (;;) {
+        pf_item it;
+        {
+            std::unique_lock<std::mutex> lock(pf_mutex);
+            pf_cv.wait(lock, [&] { return pf_stop || !pf_queue.empty(); });
+            if (pf_stop) {
+                return;
+            }
+            it = std::move(pf_queue.front());
+            pf_queue.pop_front();
+        }
+        it.ok = read_expert(*pf_model, it.il, it.eid, it.data);
+        {
+            std::lock_guard<std::mutex> lock(pf_mutex);
+            pf_done.push_back(std::move(it));
+        }
+    }
+}
+
+void llama_h1ec::request(int32_t il, int32_t eid, int tier) {
+    if (!prefetch_on || il < 0 || (size_t) il >= layers.size() || !layers[il].enabled) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(pf_mutex);
+    if (pf_queue.size() >= 64) {
+        return; // очередь ограничена — лишние запросы просто переспросятся позже
+    }
+    for (const auto & q : pf_queue) {
+        if (q.il == il && q.eid == eid) {
+            return; // уже в очереди
+        }
+    }
+    pf_item it;
+    it.il = il;
+    it.eid = eid;
+    it.tier = tier;
+    pf_queue.push_back(std::move(it));
+    pf_cv.notify_one();
+}
+
+// выбрать жертву яруса по минимальному счёту (или пустой слот)
+static int h1ec_pick_victim(const std::vector<int32_t> & slot_eid, const std::vector<double> & score) {
+    int victim = -1;
+    double vs_min = 1e300;
+    for (int s = 0; s < (int) slot_eid.size(); s++) {
+        const int ve = slot_eid[s];
+        const double vs = ve < 0 ? -1.0 : (ve < (int) score.size() ? score[ve] : 0.0);
+        if (vs < vs_min) {
+            vs_min = vs;
+            victim = s;
+        }
+    }
+    return victim;
+}
+
+int llama_h1ec::commit_ready(const llama_model & model) {
+    std::deque<pf_item> ready;
+    {
+        std::lock_guard<std::mutex> lock(pf_mutex);
+        ready.swap(pf_done);
+    }
+    int committed = 0;
+    for (auto & it : ready) {
+        if (!it.ok) {
+            continue;
+        }
+        auto & l = layers[it.il];
+        if (it.tier == 0) {
+            if (l.h_mask[it.eid] > 0.0f) {
+                continue; // уже в VRAM (успел другой путь)
+            }
+            const int victim = h1ec_pick_victim(l.slot_eid, l.score);
+            if (victim >= 0 && assign(model, it.il, victim, it.eid, it.data.data())) {
+                committed++;
+            }
+        } else {
+            if (l.h_ram[it.eid] >= 0 || l.ram_slots <= 0) {
+                continue;
+            }
+            const int victim = h1ec_pick_victim(l.ram_slot_eid, l.score);
+            if (victim >= 0 && assign_ram(model, it.il, victim, it.eid, it.data.data())) {
+                committed++;
+            }
+        }
+    }
+    return committed;
+}
+
+//
 // автопилот: менеджер кэша в ядре (порт политики из h1-expert-cache)
 //
 
 llama_h1ec::~llama_h1ec() {
+    {
+        std::lock_guard<std::mutex> lock(pf_mutex);
+        pf_stop = true;
+    }
+    pf_cv.notify_all();
+    if (pf_thread.joinable()) {
+        pf_thread.join();
+    }
     flush();
     if (autopilot && stat_total > 0) {
         LLAMA_LOG_INFO("h1ec: hit rate %.1f%% (%lld/%lld), swaps %lld\n",
@@ -589,6 +743,11 @@ int llama_h1ec::update_layer(const llama_model & model, int32_t il, int32_t budg
         if (victim_slot < 0 || l.score[eid] < victim_score * 1.5 + 2.0) {
             break;
         }
+        if (prefetch_on) {
+            request(il, eid, 0); // диск прочитает воркер, коммит на следующем тике
+            swaps++;
+            continue;
+        }
         if (!assign(model, il, victim_slot, eid)) {
             break;
         }
@@ -614,6 +773,11 @@ int llama_h1ec::update_layer(const llama_model & model, int32_t il, int32_t budg
         }
         if (victim_slot < 0 || l.score[eid] < victim_score * 1.5 + 2.0) {
             break;
+        }
+        if (prefetch_on) {
+            request(il, eid, 1);
+            swaps++;
+            continue;
         }
         if (!assign_ram(model, il, victim_slot, eid)) {
             break;
@@ -663,6 +827,9 @@ void llama_h1ec::post_decode(const llama_model & model, int32_t n_tokens) {
             s *= 0.9; // полураспад ~7 апдейтов
         }
     }
+    // сначала закоммитить готовые префетч-чтения (диск уже отработал в фоне)
+    stat_swaps += commit_ready(model);
+
     int budget = swap_budget;
     for (size_t il = 0; il < layers.size() && budget > 0; il++) {
         if (!layers[il].enabled) {
