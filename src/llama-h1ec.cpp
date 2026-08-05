@@ -309,6 +309,35 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
         open_blob(model, bp);
     }
 
+    // --- M1.2b: прогрев ярусов последовательным чтением блоба (деф. ВКЛ при
+    // блобе+ярусах). Онлайн-роллинг яруса на модели >RAM конкурирует с чтениями
+    // декода за диск и топит его (замер GLM-Air 04.08: 0.5 t/s против стока 0.9);
+    // один seq-проход по блобу заполняет ярусы ДО генерации почти бесплатно.
+    // Эвристика без истории: VRAM берёт экспертов [0..n_slots), RAM — следующие.
+    {
+        const char * v = getenv("H1EC_PREWARM");
+        const bool prewarm = (v == nullptr || *v == '\0') ? (blob != nullptr) : (atoi(v) != 0);
+        if (prewarm && blob) {
+            const int64_t t0 = ggml_time_us();
+            int loaded = 0;
+            for (size_t il = 0; il < layers.size(); il++) {
+                auto & l = layers[il];
+                if (!l.enabled || blob_index.empty() || blob_index[il].base == 0) {
+                    continue;
+                }
+                for (int s = 0; s < l.n_slots && s < n_expert; s++) {
+                    loaded += assign(model, (int32_t) il, s, s) ? 1 : 0;
+                }
+                for (int s = 0; s < l.ram_slots && l.n_slots + s < n_expert; s++) {
+                    loaded += assign_ram(model, (int32_t) il, s, l.n_slots + s) ? 1 : 0;
+                }
+            }
+            flush();
+            LLAMA_LOG_INFO("%s: prewarm %d experts in %.1f s\n",
+                    __func__, loaded, (ggml_time_us() - t0) / 1e6);
+        }
+    }
+
     // --- M1.3: префетч (деф. ВЫКЛ — замер 04.08: на бюджетном NVMe с CPU-bound
     // декодом фоновый IO конкурирует с mmap-чтениями критического пути и отъедает
     // ядро у матмулов, 6.3→5.0 t/s; включать H1EC_PREFETCH=1 на конфигурациях,
