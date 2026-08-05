@@ -285,6 +285,7 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
 
     // отдельный бэкенд (свой CUDA-стрим) для асинхронной заливки срезов
     backend_async.reset(ggml_backend_dev_init(dev, nullptr));
+    pin_buft = ggml_backend_dev_host_buffer_type(dev);
 
     for (auto & l : layers) {
         if (!l.enabled) {
@@ -494,9 +495,10 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
                 // готовые байты из префетч-стейджинга (up|gate|down подряд)
                 ggml_backend_tensor_set(dsts[k], src_data + data_off, (size_t) slot * nb2, nb2);
                 data_off += nb2;
-            } else if (backend_async && srcs[k]->buffer && ggml_backend_buffer_is_host(srcs[k]->buffer)) {
-                // веса модели в host-памяти (pinned при -ngl) — async H2D прямо из них,
-                // без стейджинга; sync один на пачку (flush перед следующим графом)
+            } else if (backend_async && pin_buft && srcs[k]->buffer &&
+                       ggml_backend_buffer_get_type(srcs[k]->buffer) == pin_buft) {
+                // async H2D ТОЛЬКО из pinned-памяти (--no-mmap кладёт веса в CUDA_Host);
+                // из mmap-страниц cudaMemcpyAsync падает invalid argument (Windows)
                 ggml_backend_tensor_set_async(backend_async.get(), dsts[k],
                         (const char *) srcs[k]->data + (size_t) eid * nb2, (size_t) slot * nb2, nb2);
                 dirty = true;

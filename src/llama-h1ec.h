@@ -90,6 +90,9 @@ struct llama_h1ec {
     // источники — pinned-память модели, копии летят без стейджинга, sync = flush()
     ggml_backend_ptr backend_async;
     bool             dirty = false; // есть незавершённые async-копии
+    ggml_backend_buffer_type_t pin_buft = nullptr; // host-pinned buft GPU-девайса:
+    // async-копии ТОЛЬКО из него (cudaMemcpyAsync из mmap-страниц Windows =
+    // invalid argument; найдено на GLM 04.08 — 30B работал из-за --no-mmap/pinned)
 
     // --- M1: RAM-ярус + эксперт-блоб ---
     // Память держит buf_ram_pin (CUDA_Host = page-locked, свопу недоступна, H2D
