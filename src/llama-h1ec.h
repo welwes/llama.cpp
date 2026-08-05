@@ -154,6 +154,13 @@ private:
     void pf_worker();
     bool read_expert(const llama_model & model, int32_t il, int32_t eid, std::vector<uint8_t> & out);
 
+    // профиль горячести: счётчики экспертов переживают перезапуск — прогрев
+    // следующего запуска берёт реально горячих, а не «первых N» (важно для
+    // моделей > RAM, где онлайн-роллинг занимает сотни токенов)
+    std::string profile_path; // H1EC_PROFILE | <блоб>.profile | пусто = выкл
+    void load_profile();
+    void save_profile();
+
 public:
     // --- автопилот (менеджер в ядре) ---
     // Включается ТОЛЬКО при env-инициализации (H1EC_SLOTS у любого штатного

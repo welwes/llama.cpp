@@ -314,11 +314,21 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
         open_blob(model, bp);
     }
 
+    // --- профиль горячести: счётчики прошлого запуска → умный прогрев ---
+    if (const char * v = getenv("H1EC_PROFILE"); v && *v) {
+        profile_path = v;
+    } else if (blob) {
+        if (const char * bp = getenv("H1EC_BLOB"); bp && *bp) {
+            profile_path = std::string(bp) + ".profile";
+        }
+    }
+    load_profile();
+
     // --- M1.2b: прогрев ярусов последовательным чтением блоба (деф. ВКЛ при
     // блобе+ярусах). Онлайн-роллинг яруса на модели >RAM конкурирует с чтениями
     // декода за диск и топит его (замер GLM-Air 04.08: 0.5 t/s против стока 0.9);
     // один seq-проход по блобу заполняет ярусы ДО генерации почти бесплатно.
-    // Эвристика без истории: VRAM берёт экспертов [0..n_slots), RAM — следующие.
+    // С профилем берём реально горячих; без истории — экспертов [0..N) по порядку.
     {
         const char * v = getenv("H1EC_PREWARM");
         const bool prewarm = (v == nullptr || *v == '\0') ? (blob != nullptr) : (atoi(v) != 0);
@@ -330,16 +340,26 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
                 if (!l.enabled || blob_index.empty() || blob_index[il].base == 0) {
                     continue;
                 }
-                for (int s = 0; s < l.n_slots && s < n_expert; s++) {
-                    loaded += assign(model, (int32_t) il, s, s) ? 1 : 0;
+                std::vector<int> order(n_expert);
+                for (int e = 0; e < n_expert; e++) {
+                    order[e] = e;
                 }
-                for (int s = 0; s < l.ram_slots && l.n_slots + s < n_expert; s++) {
-                    loaded += assign_ram(model, (int32_t) il, s, l.n_slots + s) ? 1 : 0;
+                if ((int32_t) l.score.size() == n_expert) {
+                    std::sort(order.begin(), order.end(),
+                            [&](int a, int b) { return l.score[a] > l.score[b]; });
+                }
+                int rank = 0;
+                for (int s = 0; s < l.n_slots && rank < n_expert; s++, rank++) {
+                    loaded += assign(model, (int32_t) il, s, order[rank]) ? 1 : 0;
+                }
+                for (int s = 0; s < l.ram_slots && rank < n_expert; s++, rank++) {
+                    loaded += assign_ram(model, (int32_t) il, s, order[rank]) ? 1 : 0;
                 }
             }
             flush();
-            LLAMA_LOG_INFO("%s: prewarm %d experts in %.1f s\n",
-                    __func__, loaded, (ggml_time_us() - t0) / 1e6);
+            LLAMA_LOG_INFO("%s: prewarm %d experts in %.1f s%s\n",
+                    __func__, loaded, (ggml_time_us() - t0) / 1e6,
+                    profile_path.empty() ? "" : " (profile-guided)");
         }
     }
 
@@ -623,6 +643,59 @@ bool llama_h1ec::assign_ram(const llama_model & model, int32_t il, int32_t slot,
 }
 
 //
+// профиль горячести: счётчики экспертов между запусками
+//
+
+void llama_h1ec::load_profile() {
+    if (profile_path.empty()) {
+        return;
+    }
+    FILE * f = fopen(profile_path.c_str(), "rb");
+    if (!f) {
+        return; // первого запуска ещё не было
+    }
+    uint32_t n_l = 0, n_e = 0;
+    if (fread(&n_l, 4, 1, f) != 1 || fread(&n_e, 4, 1, f) != 1 ||
+        n_l != layers.size() || (int32_t) n_e != n_expert) {
+        LLAMA_LOG_WARN("%s: profile shape mismatch — ignored\n", __func__);
+        fclose(f);
+        return;
+    }
+    int loaded = 0;
+    for (auto & l : layers) {
+        std::vector<double> row(n_expert);
+        if (fread(row.data(), sizeof(double), n_expert, f) != (size_t) n_expert) {
+            break;
+        }
+        if (l.enabled) {
+            l.score = std::move(row);
+            loaded++;
+        }
+    }
+    fclose(f);
+    LLAMA_LOG_INFO("%s: hotness profile loaded (%d layers) from %s\n", __func__, loaded, profile_path.c_str());
+}
+
+void llama_h1ec::save_profile() {
+    if (profile_path.empty()) {
+        return;
+    }
+    FILE * f = fopen(profile_path.c_str(), "wb");
+    if (!f) {
+        return;
+    }
+    const uint32_t n_l = (uint32_t) layers.size(), n_e = (uint32_t) n_expert;
+    fwrite(&n_l, 4, 1, f);
+    fwrite(&n_e, 4, 1, f);
+    std::vector<double> zeros(n_expert, 0.0);
+    for (auto & l : layers) {
+        const double * row = (l.enabled && (int32_t) l.score.size() == n_expert) ? l.score.data() : zeros.data();
+        fwrite(row, sizeof(double), n_expert, f);
+    }
+    fclose(f);
+}
+
+//
 // M1.3: префетч — фоновый IO-поток + двухфазный коммит
 //
 
@@ -757,6 +830,7 @@ llama_h1ec::~llama_h1ec() {
         pf_thread.join();
     }
     flush();
+    save_profile();
     if (autopilot && stat_total > 0) {
         LLAMA_LOG_INFO("h1ec: hit rate %.1f%% (%lld/%lld), swaps %lld\n",
                 100.0 * stat_hits / stat_total, stat_hits, stat_total, stat_swaps);
@@ -898,6 +972,13 @@ void llama_h1ec::post_decode(const llama_model & model, int32_t n_tokens) {
         stat_swaps += done;
     }
     flush(); // все async-заливки пачки должны сесть до следующего графа
+
+    // периодический сейв профиля: cli может выйти без деструктора модели
+    static int updates_since_save = 0;
+    if (++updates_since_save >= 16) {
+        updates_since_save = 0;
+        save_profile();
+    }
 }
 
 //
