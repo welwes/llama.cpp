@@ -283,9 +283,13 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
     // нули: любой квант из нулевых байтов декодируется в 0 (случайный мусор мог бы дать NaN)
     ggml_backend_buffer_clear(buf.get(), 0);
 
-    // отдельный бэкенд (свой CUDA-стрим) для асинхронной заливки срезов
-    backend_async.reset(ggml_backend_dev_init(dev, nullptr));
-    pin_buft = ggml_backend_dev_host_buffer_type(dev);
+    // отдельный бэкенд (свой CUDA-стрим) для асинхронной заливки срезов;
+    // H1EC_ASYNC=0 — полностью синхронные заливки (рубильник: на GLM+mmap
+    // cudaMemcpyAsync падал invalid argument даже из CUDA_Host-буфера)
+    if (const char * v = getenv("H1EC_ASYNC"); !(v && atoi(v) == 0)) {
+        backend_async.reset(ggml_backend_dev_init(dev, nullptr));
+        pin_buft = ggml_backend_dev_host_buffer_type(dev);
+    }
 
     for (auto & l : layers) {
         if (!l.enabled) {
