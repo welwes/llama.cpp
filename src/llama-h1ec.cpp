@@ -491,6 +491,20 @@ bool llama_h1ec::assign(const llama_model & model, int32_t il, int32_t slot, int
         const auto & src_l = model.layers[il];
         ggml_tensor * srcs[3] = { src_l.ffn_up_exps, src_l.ffn_gate_exps, src_l.ffn_down_exps };
         ggml_tensor * dsts[3] = { l.cache_up, l.cache_gate, l.cache_down };
+
+        // предпочитаем блоб: 1 seq-read вместо 3 mmap-фолтов, и работает даже при
+        // отложенной загрузке весов (llama-cli: load_mode=none — данные тензоров
+        // на этапе init ещё NULL; чтение из них и был краш 05.08)
+        std::vector<uint8_t> blob_buf;
+        if (src_data == nullptr && blob && !blob_index.empty() && blob_index[il].base > 0) {
+            if (read_expert(model, il, eid, blob_buf)) {
+                src_data = blob_buf.data();
+            }
+        }
+        if (src_data == nullptr && (!srcs[0]->data || !srcs[1]->data || !srcs[2]->data)) {
+            return false; // веса ещё не загружены (deferred) и блоба нет — не читать NULL
+        }
+
         std::vector<uint8_t> staging;
         size_t data_off = 0;
         for (int k = 0; k < 3; k++) {
@@ -586,6 +600,9 @@ bool llama_h1ec::assign_ram(const llama_model & model, int32_t il, int32_t slot,
             }
         } else {
             // фолбэк: 3 чтения из mmap модели (под давлением RAM — случайные и дорогие)
+            if (!srcs[0]->data || !srcs[1]->data || !srcs[2]->data) {
+                return false; // deferred-загрузка: весов ещё нет
+            }
             for (int k = 0; k < 3; k++) {
                 const size_t nb2 = srcs[k]->nb[2];
                 memcpy((char *) dsts[k]->data + (size_t) slot * nb2,
@@ -625,6 +642,9 @@ bool llama_h1ec::read_expert(const llama_model & model, int32_t il, int32_t eid,
         return fread(out.data(), 1, total, blob) == total;
     }
     // mmap-фолбэк: page faults случаются в ЭТОМ (фоновом) потоке, декод не блокируется
+    if (!srcs[0]->data || !srcs[1]->data || !srcs[2]->data) {
+        return false; // deferred-загрузка: весов ещё нет
+    }
     size_t off = 0;
     for (int k = 0; k < 3; k++) {
         const size_t nb2 = srcs[k]->nb[2];
