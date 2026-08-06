@@ -315,9 +315,10 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
     }
 
     // --- профиль горячести: счётчики прошлого запуска → умный прогрев ---
-    if (const char * v = getenv("H1EC_PROFILE"); v && *v) {
+    // H1EC_PROFILE: путь к файлу | "1" = дефолтный путь рядом с блобом | "0" = выкл
+    if (const char * v = getenv("H1EC_PROFILE"); v && *v && strcmp(v, "0") != 0 && strcmp(v, "1") != 0) {
         profile_path = v;
-    } else if (blob) {
+    } else if (!(getenv("H1EC_PROFILE") && strcmp(getenv("H1EC_PROFILE"), "0") == 0) && blob) {
         if (const char * bp = getenv("H1EC_BLOB"); bp && *bp) {
             profile_path = std::string(bp) + ".profile";
         }
