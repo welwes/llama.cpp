@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-h1ec.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1464,6 +1465,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    h1ec             (params.h1ec),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -2077,6 +2079,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // H1EC (форк): цепочка экспертов вынесена в лямбду, чтобы вызывать её дважды —
+    // по VRAM-кэшу (h1_ids/h1_w GPU-ветки) и по оригинальным тензорам (CPU-остаток).
+    // Стоковый путь — один вызов с оригинальными аргументами, поведение 1:1.
+    auto expert_chain = [&](ggml_tensor * x3d, ggml_tensor * sel_ids, ggml_tensor * w_sel,
+                            ggml_tensor * c_gate_up, ggml_tensor * c_up, ggml_tensor * c_gate, ggml_tensor * c_down) -> ggml_tensor * {
+    ggml_tensor * cur = x3d;
+    ggml_tensor * selected_experts = sel_ids;
+    ggml_tensor * weights = w_sel;
+    ggml_tensor * gate_up_exps = c_gate_up;
+    ggml_tensor * up_exps   = c_up;
+    ggml_tensor * gate_exps = c_gate;
+    ggml_tensor * down_exps = c_down;
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2225,6 +2240,83 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
+    }
+
+    return experts;
+    }; // конец expert_chain
+
+    // H1EC: сплит на VRAM-кэш + CPU-остаток (схема v3, см. llama-h1ec.h).
+    // Только декод (n_tokens<=8): префилл compute-bound и дружит с offload_op,
+    // плюс отрицательные id CPU-ветки не должны попасть на CUDA.
+    // Ограничения: биасы/скейлы индексируются оригинальными id — с кэшем нельзя;
+    // GROVEMOE переизображает id; weight_before_ffn меняет порядок взвешивания.
+    const llama_h1ec_layer * h1l = h1ec ? h1ec->get_layer(il) : nullptr;
+    const bool use_h1 = h1l != nullptr && n_tokens > 0 && n_tokens <= 8 && !weight_before_ffn &&
+        gate_up_exps == nullptr && arch != LLM_ARCH_GROVEMOE &&
+        up_exps_b   == nullptr && gate_exps_b   == nullptr && down_exps_b == nullptr &&
+        gate_up_exps_b == nullptr &&
+        up_exps_s   == nullptr && gate_exps_s   == nullptr && down_exps_s == nullptr &&
+        (loras == nullptr || loras->empty()) &&
+        (int64_t) h1ec->n_expert == n_expert;
+
+    ggml_tensor * experts = nullptr;
+
+    if (use_h1) {
+        // topk может быть невыгружаемым видом — уплотняем
+        ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used * n_tokens);
+        // стэш для автопилота: читается в post_decode ПОСЛЕ завершения графа, поэтому
+        // буфер тензора нельзя отдавать под реюз (иначе прочитаем мусор чужого тензора)
+        ggml_set_output(sel_flat->src[0]);
+        h1l->sel_last = sel_flat;
+
+        ggml_tensor * ids_gpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, h1l->slot_map, sel_flat), n_expert_used, n_tokens);
+        ggml_tensor * ids_cpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, h1l->cpu_map,  sel_flat), n_expert_used, n_tokens);
+        ggml_tensor * m_hit   = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, h1l->mask,     sel_flat), 1, n_expert_used, n_tokens);
+        cb(ids_gpu, "h1ec_ids_gpu", il);
+        cb(ids_cpu, "h1ec_ids_cpu", il);
+
+        ggml_tensor * w_gpu = ggml_mul(ctx0, weights, m_hit); // веса промахов занулены
+
+        // RAM-ярус (M1.2): третья ветка — pinned-host кэш экспертов; промахи
+        // яруса идут в id=-1 (CPU-скип строк), мусорных столбцов не нужно
+        ggml_tensor * ids_ram = nullptr;
+        ggml_tensor * w_ram   = nullptr;
+        if (h1l->ram_up != nullptr) {
+            ids_ram = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, h1l->ram_map, sel_flat), n_expert_used, n_tokens);
+            ggml_tensor * m_ram = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, h1l->mask_ram, sel_flat), 1, n_expert_used, n_tokens);
+            w_ram = ggml_mul(ctx0, weights, m_ram);
+        }
+        ggml_tensor * w_cpu = ggml_sub(ctx0, weights, w_gpu); // веса чужих ярусов занулены
+        if (w_ram != nullptr) {
+            w_cpu = ggml_sub(ctx0, w_cpu, w_ram);
+        }
+
+        // Порядок узлов = порядок сплитов планировщика. cpu_map/ram_map лежат в
+        // CPU-памяти, поэтому их get_rows — CPU-узлы; закрепив их МЕЖДУ гейтингом
+        // и кэш-цепочкой, получаем сплиты [GPU гейтинг+веса][CPU ids][GPU кэш]
+        // [CPU эксперты][GPU add]: CPU-ветки стартуют после короткого сплита ids
+        // и считаются ПАРАЛЛЕЛЬНО с кэш-цепочкой на GPU.
+        ggml_build_forward_expand(gf, w_gpu);
+        if (w_ram != nullptr) {
+            ggml_build_forward_expand(gf, w_ram);
+        }
+        ggml_build_forward_expand(gf, w_cpu);
+        ggml_build_forward_expand(gf, ids_cpu);
+        if (ids_ram != nullptr) {
+            ggml_build_forward_expand(gf, ids_ram);
+        }
+
+        ggml_tensor * e_gpu = expert_chain(cur, ids_gpu, w_gpu, nullptr, h1l->cache_up, h1l->cache_gate, h1l->cache_down);
+        if (ids_ram != nullptr) {
+            ggml_tensor * e_ram = expert_chain(cur, ids_ram, w_ram, nullptr, h1l->ram_up, h1l->ram_gate, h1l->ram_down);
+            e_gpu = ggml_add(ctx0, e_gpu, e_ram);
+        }
+        ggml_tensor * e_cpu = expert_chain(cur, ids_cpu, w_cpu, nullptr, up_exps, gate_exps, down_exps);
+
+        experts = ggml_add(ctx0, e_gpu, e_cpu);
+        cb(experts, "h1ec_moe_out", il);
+    } else {
+        experts = expert_chain(cur, selected_experts, weights, gate_up_exps, up_exps, gate_exps, down_exps);
     }
 
     ggml_build_forward_expand(gf, experts);
