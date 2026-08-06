@@ -179,7 +179,7 @@ public:
     // исчезает только с этим — виновата CPU-ветка; если остаётся — GPU-кэш-ветка.
     bool    no_cpu_remap = false;
     int32_t tokens_since_update = 0;
-    long long stat_hits = 0, stat_total = 0, stat_swaps = 0;
+    long long stat_hits = 0, stat_hits_ram = 0, stat_total = 0, stat_swaps = 0;
 
     // вызывается из llama_context::decode после каждого h1-декода (n_tokens<=8):
     // копит счётчики из sel_last, раз в update_every токенов — затухание и свопы

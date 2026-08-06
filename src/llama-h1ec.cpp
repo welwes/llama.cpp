@@ -832,8 +832,9 @@ llama_h1ec::~llama_h1ec() {
     flush();
     save_profile();
     if (autopilot && stat_total > 0) {
-        LLAMA_LOG_INFO("h1ec: hit rate %.1f%% (%lld/%lld), swaps %lld\n",
-                100.0 * stat_hits / stat_total, stat_hits, stat_total, stat_swaps);
+        LLAMA_LOG_INFO("h1ec: hit rate vram %.1f%% + ram %.1f%% (%lld+%lld/%lld), swaps %lld\n",
+                100.0 * stat_hits / stat_total, 100.0 * stat_hits_ram / stat_total,
+                stat_hits, stat_hits_ram, stat_total, stat_swaps);
     }
 }
 
@@ -943,7 +944,9 @@ void llama_h1ec::post_decode(const llama_model & model, int32_t n_tokens) {
             l.score[e] += 1.0;
             stat_total++;
             if (l.h_mask[e] > 0.0f) {
-                stat_hits++;
+                stat_hits++;      // VRAM-ярус
+            } else if (l.h_mask_ram[e] > 0.0f) {
+                stat_hits_ram++;  // RAM-ярус (раньше не считался — «hit rate 1.8%» на GLM был артефактом)
             }
         }
     }
