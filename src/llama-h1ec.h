@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
