@@ -2251,7 +2251,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Ограничения: биасы/скейлы индексируются оригинальными id — с кэшем нельзя;
     // GROVEMOE переизображает id; weight_before_ffn меняет порядок взвешивания.
     const llama_h1ec_layer * h1l = h1ec ? h1ec->get_layer(il) : nullptr;
-    const bool use_h1 = h1l != nullptr && n_tokens > 0 && n_tokens <= 8 && !weight_before_ffn &&
+    const bool use_h1 = h1l != nullptr && n_tokens > 0 && n_tokens <= h1ec->max_batch && !weight_before_ffn &&
         gate_up_exps == nullptr && arch != LLM_ARCH_GROVEMOE &&
         up_exps_b   == nullptr && gate_exps_b   == nullptr && down_exps_b == nullptr &&
         gate_up_exps_b == nullptr &&

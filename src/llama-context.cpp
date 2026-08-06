@@ -1910,7 +1910,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // декоды — h1-сплит и стэш sel_last строятся при n_tokens <= 8).
         // ЖЁСТКО синхронизируемся перед записями: граф запущен асинхронно, свопы
         // под летящим графом = кернелы читают полуобновлённые карты/кэш = мусор.
-        if (model.h1ec && model.h1ec->autopilot && ubatch.n_tokens <= 8) {
+        if (model.h1ec && model.h1ec->autopilot && (int32_t) ubatch.n_tokens <= model.h1ec->max_batch) {
             ggml_backend_sched_synchronize(sched.get());
             model.h1ec->post_decode(model, (int32_t) ubatch.n_tokens);
         }

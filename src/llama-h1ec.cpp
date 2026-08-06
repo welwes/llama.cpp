@@ -52,6 +52,10 @@ bool llama_h1ec::init(const llama_model & model, const std::vector<int32_t> & sl
         no_cpu_remap = true; // диагностика: CPU-ветка без ремапа, попадания с весом 0
         LLAMA_LOG_WARN("%s: H1EC_NO_CPU_REMAP=1 - CPU branch computes hits too (weight 0)\n", __func__);
     }
+    if (const char * v = getenv("H1EC_MAX_BATCH"); v && atoi(v) > 0) {
+        max_batch = std::min(atoi(v), 31); // ≥32 включает offload_op → отрицательные id уедут на CUDA
+        LLAMA_LOG_INFO("%s: H1EC_MAX_BATCH=%d (h1-split active up to this batch size)\n", __func__, max_batch);
+    }
     bool fat_pool = false;
     if (const char * v = getenv("H1EC_FAT"); v && atoi(v) != 0) {
         fat_pool = true; // диагностика: раскладка БЕЗ перекрытий (жирный пул — только на малом числе слоёв!)
