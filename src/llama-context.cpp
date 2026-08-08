@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-h1ec.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -1637,6 +1638,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    // H1EC: страховка — незавершённые async-заливки кэша обязаны сесть до графа
+    if (model.h1ec && model.h1ec->dirty) {
+        model.h1ec->flush();
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1844,6 +1850,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        // H1EC автопилот: счётчики экспертов + онлайн-свопы кэша (только короткие
+        // декоды — h1-сплит и стэш sel_last строятся при n_tokens <= 8).
+        // ЖЁСТКО синхронизируемся перед записями: граф запущен асинхронно, свопы
+        // под летящим графом = кернелы читают полуобновлённые карты/кэш = мусор.
+        if (model.h1ec && model.h1ec->autopilot && (int32_t) ubatch.n_tokens <= model.h1ec->max_batch) {
+            ggml_backend_sched_synchronize(sched.get());
+            model.h1ec->post_decode(model, (int32_t) ubatch.n_tokens);
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -2464,6 +2479,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.h1ec        =*/ model.h1ec.get(),
     };
 }
 
@@ -3565,6 +3581,41 @@ llama_context * llama_init_from_model(
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
         return nullptr;
+    }
+
+    // H1EC: авто-инициализация кэша экспертов из окружения (обязана случиться
+    // ДО создания контекста — топология графа зависит от наличия кэша).
+    // Явная инициализация через llama_h1ec_init* имеет приоритет (autopilot
+    // остаётся выключенным — политикой рулит вызывающий код).
+    if (!model->h1ec) {
+        const char * env_slots = getenv("H1EC_SLOTS");
+        const char * env_csv   = getenv("H1EC_LAYER_SLOTS");
+        bool inited = false;
+        if (env_csv && *env_csv) {
+            std::vector<int32_t> per_layer;
+            for (const char * p = env_csv; *p; ) {
+                per_layer.push_back(atoi(p));
+                while (*p && *p != ',') p++;
+                if (*p == ',') p++;
+            }
+            if (per_layer.size() == model->layers.size()) {
+                inited = llama_h1ec_init_layers(model, per_layer.data(), (int32_t) per_layer.size());
+            } else {
+                LLAMA_LOG_WARN("%s: H1EC_LAYER_SLOTS has %zu values, model has %zu layers — ignored\n",
+                        __func__, per_layer.size(), model->layers.size());
+            }
+        } else if (env_slots && atoi(env_slots) > 0) {
+            inited = llama_h1ec_init(model, atoi(env_slots));
+        }
+        if (inited) {
+            auto & ec = *model->h1ec;
+            const char * v;
+            ec.autopilot    = !(v = getenv("H1EC_ONLINE")) || atoi(v) != 0;
+            if ((v = getenv("H1EC_UPDATE_EVERY")) && atoi(v) > 0) ec.update_every = atoi(v);
+            if ((v = getenv("H1EC_SWAPS"))        && atoi(v) > 0) ec.swap_budget  = atoi(v);
+            LLAMA_LOG_INFO("%s: h1ec autopilot %s (update every %d tokens, swap budget %d)\n",
+                    __func__, ec.autopilot ? "ON" : "off", ec.update_every, ec.swap_budget);
+        }
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {

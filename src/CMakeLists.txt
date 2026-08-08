@@ -19,6 +19,7 @@ add_library(llama
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp
+            llama-h1ec.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
