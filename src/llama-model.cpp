@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-ext.h"
+#include "llama-h1ec.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"

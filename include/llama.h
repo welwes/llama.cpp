@@ -543,6 +543,25 @@ extern "C" {
     LLAMA_API size_t llama_max_parallel_sequences(void);
     LLAMA_API size_t llama_max_tensor_buft_overrides(void);
 
+    // H1 expert cache: VRAM-кэш экспертов MoE (форк, см. src/llama-h1ec.h).
+    // llama_h1ec_init звать ПОСЛЕ загрузки модели и ДО создания контекста;
+    // llama_h1ec_assign — между вызовами llama_decode (кладёт эксперта в слот,
+    // expert_id < 0 освобождает слот). Возврат false = не применилось.
+    LLAMA_API bool    llama_h1ec_init    (struct llama_model * model, int32_t n_slots);
+    // layer-aware бюджет: своя ёмкость каждому слою (0 = слой без кэша); n = число слоёв модели
+    LLAMA_API bool    llama_h1ec_init_layers(struct llama_model * model, const int32_t * slots_per_layer, int32_t n);
+    LLAMA_API int32_t llama_h1ec_n_slots (const struct llama_model * model); // максимум по слоям
+    LLAMA_API int32_t llama_h1ec_layer_slots(const struct llama_model * model, int32_t il);
+    LLAMA_API bool    llama_h1ec_assign  (struct llama_model * model, int32_t il, int32_t slot, int32_t expert_id);
+    // обход кэша без его потери (нулевые маски): для численной верификации
+    LLAMA_API void    llama_h1ec_bypass  (struct llama_model * model, bool on);
+    // дождаться асинхронных заливок assign (звать после пачки; декод страхуется сам)
+    LLAMA_API void    llama_h1ec_flush   (struct llama_model * model);
+    // RAM-ярус (M1.2): pinned-host кэш экспертов, включается env H1EC_RAM_MB;
+    // источник заливки — эксперт-блоб (env H1EC_BLOB, файл от h1-blob-pack) или mmap
+    LLAMA_API bool    llama_h1ec_assign_ram(struct llama_model * model, int32_t il, int32_t slot, int32_t expert_id);
+    LLAMA_API int32_t llama_h1ec_layer_ram_slots(const struct llama_model * model, int32_t il);
+
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
     LLAMA_API bool llama_supports_gpu_offload(void);
