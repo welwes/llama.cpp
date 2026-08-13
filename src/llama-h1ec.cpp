@@ -848,6 +848,32 @@ llama_h1ec::~llama_h1ec() {
         LLAMA_LOG_INFO("h1ec: hit rate vram %.1f%% + ram %.1f%% (%lld+%lld/%lld), swaps %lld\n",
                 100.0 * stat_hits / stat_total, 100.0 * stat_hits_ram / stat_total,
                 stat_hits, stat_hits_ram, stat_total, stat_swaps);
+        // пер-слойная сводка: сырьё для layer-aware H1EC_LAYER_SLOTS
+        std::string csv;
+        double worst_rate = 101.0;
+        int    worst_il   = -1;
+        for (size_t il = 0; il < layers.size(); il++) {
+            const auto & l = layers[il];
+            if (!l.enabled || l.stat_total == 0) {
+                continue;
+            }
+            const double rate = 100.0 * (l.stat_hits + l.stat_hits_ram) / l.stat_total;
+            if (!csv.empty()) {
+                csv += ",";
+            }
+            char buf_r[16];
+            snprintf(buf_r, sizeof(buf_r), "%.0f", rate);
+            csv += buf_r;
+            if (rate < worst_rate) {
+                worst_rate = rate;
+                worst_il   = (int) il;
+            }
+        }
+        if (worst_il >= 0) {
+            LLAMA_LOG_INFO("h1ec: layer hit rates %% (csv, layer order): %s\n", csv.c_str());
+            LLAMA_LOG_INFO("h1ec: worst layer %d @ %.1f%% — донор бюджета для H1EC_LAYER_SLOTS\n",
+                    worst_il, worst_rate);
+        }
     }
 }
 
@@ -956,10 +982,13 @@ void llama_h1ec::post_decode(const llama_model & model, int32_t n_tokens) {
             }
             l.score[e] += 1.0;
             stat_total++;
+            l.stat_total++;
             if (l.h_mask[e] > 0.0f) {
                 stat_hits++;      // VRAM-ярус
+                l.stat_hits++;
             } else if (l.h_mask_ram[e] > 0.0f) {
                 stat_hits_ram++;  // RAM-ярус (раньше не считался — «hit rate 1.8%» на GLM был артефактом)
+                l.stat_hits_ram++;
             }
         }
     }
@@ -994,6 +1023,15 @@ void llama_h1ec::post_decode(const llama_model & model, int32_t n_tokens) {
     if (++updates_since_save >= 16) {
         updates_since_save = 0;
         save_profile();
+    }
+
+    // сигнал «кэш мёртв»: счётчики капают, но хитов нет вообще — значит либо
+    // все слои в стоковом фолбэке, либо конфиг битый; молчать нельзя —
+    // деградация иначе видна только по t/s
+    if (!warned_zero_hits && stat_total > 20000 && stat_hits + stat_hits_ram == 0) {
+        warned_zero_hits = true;
+        LLAMA_LOG_WARN("h1ec: %lld selections counted, ZERO cache hits — cache is not working "
+                "(check stock-fallback warnings / config)\n", stat_total);
     }
 }
 

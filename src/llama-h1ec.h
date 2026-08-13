@@ -74,12 +74,20 @@ struct llama_h1ec_layer {
     std::vector<double>   score;
     mutable ggml_tensor * sel_last = nullptr;
 
+    // пер-слойная статистика хитов: данные для layer-aware раскладки
+    // H1EC_LAYER_SLOTS на следующий запуск (сводка печатается в деструкторе)
+    int64_t stat_hits     = 0;
+    int64_t stat_hits_ram = 0;
+    int64_t stat_total    = 0;
+
     bool enabled = false;
 };
 
 struct llama_h1ec {
     int32_t n_slots  = 0; // максимум по слоям (для справки; ёмкость слоя — layers[il].n_slots)
     int32_t n_expert = 0;
+
+    bool warned_zero_hits = false; // одноразовый сигнал «счётчики капают, хитов ноль»
 
     std::vector<llama_h1ec_layer> layers;
 
