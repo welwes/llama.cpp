@@ -76,7 +76,8 @@ class LlamaModel(TextModel):
             if aux_layer_ids:
                 target_layers = aux_layer_ids
             else:
-                target_layers = [2, target_num_layers // 2, target_num_layers - 3]
+                # SpecForge/SGLang convention: [1, num_layers//2 - 1, num_layers - 4]
+                target_layers = [1, target_num_layers // 2 - 1, target_num_layers - 4]
             logger.info(f"EAGLE-3: target_layers = {target_layers} (target model has {target_num_layers} layers)")
             self.gguf_writer.add_target_layers(target_layers)
 

@@ -2260,6 +2260,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         (loras == nullptr || loras->empty()) &&
         (int64_t) h1ec->n_expert == n_expert;
 
+    // ГРОМКИЙ fallback: кэш инициализирован, но h1-сплит структурно выключен —
+    // warn один раз за процесс (НЕ на префилле n_tokens>max_batch — это легальный
+    // обход). Сигнал регрессии при ребейзе на новый апстрим: upstream мог сменить
+    // архитектурные тензоры/флаги, и кэш отвалится тихо — только t/s просядут.
+    if (!use_h1 && h1ec != nullptr && n_tokens > 0 && n_tokens <= h1ec->max_batch) {
+        static std::unordered_set<const llama_h1ec *> warned;
+        if (warned.insert(h1ec).second) {
+            const char * why = "unknown";
+            if (h1l == nullptr)                    why = "no cache slots on this MoE layer (layer-aware budget?)";
+            else if (weight_before_ffn)            why = "weight_before_ffn";
+            else if (gate_up_exps)                 why = "merged gate_up_exps";
+            else if (arch == LLM_ARCH_GROVEMOE)    why = "arch == GROVEMOE";
+            else if (up_exps_b || gate_exps_b || down_exps_b || gate_up_exps_b) why = "expert bias tensors";
+            else if (up_exps_s || gate_exps_s || down_exps_s) why = "expert scale tensors";
+            else if (loras && !loras->empty())     why = "loras active";
+            else if ((int64_t) h1ec->n_expert != n_expert) why = "expert count mismatch";
+            LLAMA_LOG_WARN("%s: h1ec cache DISABLED on layer %d: %s — decode not accelerated\n",
+                    __func__, il, why);
+        }
+    }
+
     ggml_tensor * experts = nullptr;
 
     if (use_h1) {

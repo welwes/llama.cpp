@@ -2311,6 +2311,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
+    if (has_draft && params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
+
     return result;
 }
 
